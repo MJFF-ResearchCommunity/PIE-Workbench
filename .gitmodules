@@ -1,0 +1,6 @@
+[submodule "lib/PIE"]
+	path = lib/PIE
+	url = https://github.com/MJFF-ResearchCommunity/PIE.git
+[submodule "lib/PIE-clean"]
+	path = lib/PIE-clean
+	url = https://github.com/MJFF-ResearchCommunity/PIE-clean.git
