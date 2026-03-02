@@ -29,6 +29,9 @@ interface AnalysisState {
   testCacheKey: string | null;
   modelId: string | null;
   selectedFeatures: string[];
+  calibratedModelId: string | null;
+  ensembleModelId: string | null;
+  driftResult: string | null;
 }
 
 interface AppStore {
@@ -81,6 +84,9 @@ const initialAnalysisState: AnalysisState = {
   testCacheKey: null,
   modelId: null,
   selectedFeatures: [],
+  calibratedModelId: null,
+  ensembleModelId: null,
+  driftResult: null,
 };
 
 export const useStore = create<AppStore>((set, get) => ({

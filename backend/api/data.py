@@ -694,7 +694,8 @@ async def get_data_columns(cache_key: str):
             "is_categorical": not is_numeric and unique_count < 50,
             "unique_count": unique_count,
             "null_count": int(data[col].isnull().sum()),
-            "null_pct": round(data[col].isnull().sum() / len(data) * 100, 2) if len(data) > 0 else 0
+            "null_pct": round(data[col].isnull().sum() / len(data) * 100, 2) if len(data) > 0 else 0,
+            "source_modality": "unknown",
         })
 
     result = {"columns": columns, "total_rows": len(data)}

@@ -274,10 +274,12 @@ def finalize_modular_cache(cache_key: str, total_rows: int) -> None:
     meta = _column_meta.get(cache_key, {"columns": [], "_catalog": {}})
     meta["total_rows"] = total_rows
 
-    # Build catalog (col -> file) and strip _source_file from public metadata
+    # Build catalog (col -> file) and rename _source_file to source_modality
     catalog = meta.pop("_catalog", {})
     for entry in meta["columns"]:
-        entry.pop("_source_file", None)
+        source = entry.pop("_source_file", None)
+        if source is not None:
+            entry["source_modality"] = source
 
     manifest = {
         "total_rows": total_rows,
@@ -321,6 +323,11 @@ def _read_manifest(cache_key: str) -> dict:
 def _load_manifest_into_meta(cache_key: str) -> None:
     """Repopulate _column_meta from disk manifest (process-restart recovery)."""
     manifest = _read_manifest(cache_key)
+    catalog = manifest.get("catalog", {})
+    # Re-attach source_modality for backward compat with old manifests
+    for entry in manifest["columns"]:
+        if "source_modality" not in entry:
+            entry["source_modality"] = catalog.get(entry["name"], "unknown")
     _column_meta[cache_key] = {
         "columns": manifest["columns"],
         "total_rows": manifest["total_rows"],
@@ -365,7 +372,7 @@ def load_columns(cache_key: str, columns: List[str]) -> pd.DataFrame:
         schema = pq.read_schema(parquet_path)
         available = set(schema.names)
         load_cols = [c for c in load_cols if c in available]
-        df = pd.read_parquet(parquet_path, columns=load_cols, engine="pyarrow")
+        df = _decat(pd.read_parquet(parquet_path, columns=load_cols, engine="pyarrow"))
         frames.append(df)
 
     if len(frames) == 1:
@@ -376,6 +383,20 @@ def load_columns(cache_key: str, columns: List[str]) -> pd.DataFrame:
     for other in frames[1:]:
         result = pd.merge(result, other, on=list(_JOIN_KEYS), how="outer")
     return result
+
+
+def _decat(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert all Categorical columns back to their base dtypes.
+
+    Parquet round-trips preserve Categorical dtypes from ``downcast_dataframe``.
+    Merging frames with outer joins (or later feature engineering that inserts
+    new values like ``_OTHER_``) fails on Categoricals, so we undo the
+    optimisation here where it matters.
+    """
+    cat_cols = df.select_dtypes(include=["category"]).columns
+    if len(cat_cols):
+        df[cat_cols] = df[cat_cols].astype(object)
+    return df
 
 
 def load_modalities(cache_key: str, modality_names: List[str]) -> pd.DataFrame:
@@ -391,7 +412,7 @@ def load_modalities(cache_key: str, modality_names: List[str]) -> pd.DataFrame:
         if not parquet_path.exists():
             logger.warning("Modality file not found: %s", parquet_path)
             continue
-        frames.append(pd.read_parquet(parquet_path, engine="pyarrow"))
+        frames.append(_decat(pd.read_parquet(parquet_path, engine="pyarrow")))
 
     if not frames:
         raise KeyError(f"No modality files found for: {modality_names}")

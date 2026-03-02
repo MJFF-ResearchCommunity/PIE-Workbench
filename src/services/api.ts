@@ -45,8 +45,13 @@ export const analysisApi = {
   train: (request: TrainModelRequest) => api.post('/analysis/train', request),
   runPipeline: (request: PipelineRequest) => api.post('/analysis/run_pipeline', request),
   getTaskStatus: (taskId: string) => api.get(`/analysis/task/${taskId}`),
-  getFeatureImportance: (modelId: string, topN?: number) => 
+  getFeatureImportance: (modelId: string, topN?: number) =>
     api.get(`/analysis/model/${modelId}/feature_importance?top_n=${topN || 20}`),
+  autoML: (request: AutoMLRequest) => api.post('/analysis/auto_ml', request),
+  calibrate: (request: CalibrateRequest) => api.post('/analysis/calibrate', request),
+  validateDrift: (request: DriftValidationRequest) => api.post('/analysis/validate_drift', request),
+  detectLeakage: (request: DetectLeakageRequest) => api.post('/analysis/detect_leakage', request),
+  createEnsemble: (request: EnsembleRequest) => api.post('/analysis/create_ensemble', request),
 };
 
 // Statistics API
@@ -142,6 +147,34 @@ export interface SurvivalAnalysisRequest {
   time_variable: string;
   event_variable: string;
   grouping_variable?: string;
+}
+
+export interface AutoMLRequest {
+  train_cache_key: string;
+  test_cache_key: string;
+  target_column: string;
+  time_limit?: number;
+  presets?: string;
+}
+
+export interface CalibrateRequest {
+  model_id: string;
+  method?: string;
+}
+
+export interface DriftValidationRequest {
+  train_cache_key: string;
+  test_cache_key: string;
+}
+
+export interface DetectLeakageRequest {
+  cache_key: string;
+  target_column: string;
+}
+
+export interface EnsembleRequest {
+  model_id: string;
+  method?: string;
 }
 
 export default api;
