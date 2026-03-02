@@ -179,10 +179,6 @@ export default function ProjectHub() {
           <h1 className="font-display text-5xl font-bold mb-4">
             <span className="gradient-text">PIE Workbench</span>
           </h1>
-          <p className="text-xl text-pie-text-muted max-w-2xl mx-auto">
-            The Parkinson's Insight Engine GUI — A powerful, visual interface for 
-            clinical research and machine learning on PPMI data.
-          </p>
         </motion.div>
 
         {/* Action Cards */}

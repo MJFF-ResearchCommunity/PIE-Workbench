@@ -8,3 +8,5 @@ numpy>=1.24.0
 scipy>=1.11.0
 scikit-learn>=1.3.0
 lifelines>=0.27.0
+pyarrow>=14.0.0
+psutil>=5.9.0

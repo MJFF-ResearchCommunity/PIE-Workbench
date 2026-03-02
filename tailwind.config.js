@@ -23,7 +23,7 @@ export default {
         }
       },
       fontFamily: {
-        'display': ['Playfair Display', 'Georgia', 'serif'],
+        'display': ['DM Sans', 'system-ui', 'sans-serif'],
         'sans': ['DM Sans', 'system-ui', 'sans-serif'],
         'mono': ['JetBrains Mono', 'monospace'],
       },

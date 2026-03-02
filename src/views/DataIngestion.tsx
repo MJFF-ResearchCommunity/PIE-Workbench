@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { 
@@ -57,6 +57,14 @@ export default function DataIngestion() {
   const [showPreview, setShowPreview] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [showLogs, setShowLogs] = useState(true);
+  const logEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll log panel to bottom when new entries arrive
+  useEffect(() => {
+    if (logEndRef.current && showLogs) {
+      logEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs, showLogs]);
 
   const addLog = useCallback((message: string, type: LogEntry['type'] = 'info') => {
     const timestamp = new Date().toLocaleTimeString();
@@ -145,6 +153,7 @@ export default function DataIngestion() {
 
     setLoading(true);
     setLogs([]); // Clear previous logs
+    lastLogIndexRef.current = 0; // Reset backend log cursor
     addLog('Starting data loading process...', 'info');
     addLog(`Selected modalities: ${Array.from(selectedModalities).join(', ')}`, 'info');
     
@@ -168,27 +177,46 @@ export default function DataIngestion() {
     }
   };
 
+  // Track how many backend log entries we've already shown.
+  // Using a ref instead of state to avoid stale closures in the setInterval callback —
+  // useState would capture the initial value (0) in the closure, causing ALL logs to be
+  // re-added on every poll, leading to unbounded memory growth and eventual OOM crash.
+  const lastLogIndexRef = useRef(0);
+
   const pollTaskStatus = useCallback(async () => {
     if (!taskId) return;
 
     try {
       const response = await dataApi.getStatus(taskId);
       const status = response.data;
-      
-      // Log progress updates
-      if (status.message && (!taskStatus || status.message !== taskStatus.message)) {
-        addLog(status.message, 'progress');
+
+      // Ingest any new log entries from the backend
+      const backendLogs: { timestamp: string; message: string }[] = status.logs || [];
+      if (backendLogs.length > lastLogIndexRef.current) {
+        const newEntries = backendLogs.slice(lastLogIndexRef.current);
+        for (const entry of newEntries) {
+          // Determine log type from message content
+          let type: LogEntry['type'] = 'progress';
+          if (entry.message.includes('[WARNING]') || entry.message.includes('[ERROR]') || entry.message.startsWith('WARNING')) {
+            type = 'error';
+          } else if (entry.message.includes('[INFO]') || entry.message.startsWith('  Found') || entry.message.startsWith('    -')) {
+            type = 'info';
+          } else if (entry.message.includes('loaded:') || entry.message.includes('successfully') || entry.message.includes('complete')) {
+            type = 'success';
+          } else if (entry.message.startsWith('Failed') || entry.message.startsWith('PIE-clean import failed')) {
+            type = 'error';
+          }
+          addLog(entry.message, type);
+        }
+        lastLogIndexRef.current = backendLogs.length;
       }
-      
+
       setTaskStatus(status);
       updateTask(taskId, { status: status.status, progress: status.progress * 100, message: status.message });
 
       if (status.status === 'completed') {
         setLoading(false);
         addLog('Data loading completed successfully!', 'success');
-        if (status.result?.shape) {
-          addLog(`Loaded ${status.result.shape[0].toLocaleString()} rows × ${status.result.shape[1]} columns`, 'success');
-        }
         setData({
           loaded: true,
           cacheKey: status.result.cache_key,
@@ -198,7 +226,7 @@ export default function DataIngestion() {
         });
         removeTask(taskId);
         addToast('Data loaded successfully!', 'success');
-        
+
         // Load preview
         addLog('Loading data preview...', 'info');
         await loadPreview(status.result.cache_key);
@@ -212,7 +240,7 @@ export default function DataIngestion() {
     } catch (error) {
       console.error('Failed to poll task status:', error);
     }
-  }, [taskId, taskStatus, selectedModalities, setData, addToast, updateTask, removeTask, addLog]);
+  }, [taskId, selectedModalities, setData, addToast, updateTask, removeTask, addLog]);
 
   const loadPreview = async (cacheKey: string) => {
     try {
@@ -524,12 +552,17 @@ export default function DataIngestion() {
                       </span>
                     </div>
                   ))}
+                  <div ref={logEndRef} />
                 </div>
               )}
               {loading && (
                 <div className="flex items-center gap-2 mt-2 text-blue-400">
                   <Loader2 className="w-3 h-3 animate-spin" />
-                  <span>Processing...</span>
+                  <span>
+                    {taskStatus?.message
+                      ? `Working: ${taskStatus.message}`
+                      : 'Processing...'}
+                  </span>
                 </div>
               )}
             </div>
