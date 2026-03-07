@@ -167,7 +167,10 @@ async def get_available_models(task_type: str = "classification"):
     try:
         from pie.classifier import get_model_catalog
         catalog = get_model_catalog(task_type)
-        models = [{"id": k, "name": v.get("name", k)} for k, v in catalog.items()]
+        models = [
+            {"id": k, "name": v.get("name", k) if isinstance(v, dict) else getattr(v, "name", k)}
+            for k, v in catalog.items()
+        ]
         return {"models": models}
     except ImportError:
         # Fallback static catalog
@@ -209,11 +212,46 @@ async def suggest_task_type(cache_key: str, target_column: str):
     if not disk_cache.exists(cache_key) and not disk_cache.is_modular(cache_key):
         raise HTTPException(status_code=404, detail=f"Data not found: {cache_key}")
 
-    # For modular caches, load only the target column
+    # Try column metadata first (fast, always available for modular caches)
+    col_meta = disk_cache.get_column_meta(cache_key)
+    if col_meta is None and disk_cache.is_modular(cache_key):
+        try:
+            disk_cache._load_manifest_into_meta(cache_key)
+            col_meta = disk_cache.get_column_meta(cache_key)
+        except Exception:
+            pass
+
+    if col_meta is not None:
+        col_info = next((c for c in col_meta["columns"] if c["name"] == target_column), None)
+        if col_info is not None:
+            is_numeric = col_info.get("is_numeric", False)
+            unique_count = col_info.get("unique_count", 0)
+
+            if is_numeric and unique_count > 20:
+                suggestion = "regression"
+                confidence = 0.85
+            elif unique_count <= 10:
+                suggestion = "classification"
+                confidence = 0.95
+            else:
+                suggestion = "classification"
+                confidence = 0.6
+
+            return {
+                "suggestion": suggestion,
+                "confidence": confidence,
+                "target_info": {
+                    "dtype": col_info.get("dtype", "unknown"),
+                    "unique_values": unique_count,
+                    "is_numeric": is_numeric,
+                }
+            }
+
+    # Fallback: load actual data
     if disk_cache.is_modular(cache_key):
         try:
             data = disk_cache.load_columns(cache_key, [target_column])
-        except KeyError:
+        except (KeyError, Exception):
             raise HTTPException(status_code=400, detail=f"Column not found: {target_column}")
     else:
         data = disk_cache.load(cache_key)
@@ -227,7 +265,6 @@ async def suggest_task_type(cache_key: str, target_column: str):
     is_numeric = np.issubdtype(col.dtype, np.number)
     unique_count = col.nunique()
 
-    # Heuristic: if numeric with many unique values, suggest regression
     if is_numeric and unique_count > 20:
         suggestion = "regression"
         confidence = 0.85
@@ -795,99 +832,168 @@ async def _drift_validation_task(task_id: str, request: DriftValidationRequest):
 
 @router.post("/detect_leakage")
 async def detect_leakage(request: DetectLeakageRequest):
-    """Scan features for potential data leakage using statistical heuristics."""
+    """Scan features for potential data leakage using statistical heuristics.
+
+    Uses pre-computed column metadata (from the manifest / column cache) for
+    name-based and cardinality checks so it doesn't need to reload the full
+    dataset.  Only falls back to raw data loading for correlation analysis,
+    and gracefully skips that step if the data isn't loadable.
+    """
     if not disk_cache.exists(request.cache_key) and not disk_cache.is_modular(request.cache_key):
         raise HTTPException(status_code=404, detail=f"Data not found: {request.cache_key}")
 
     start = time.time()
 
-    # Load data
-    if disk_cache.is_modular(request.cache_key):
-        df = disk_cache.load_modalities(request.cache_key, disk_cache.list_modality_files(request.cache_key))
-    else:
-        df = disk_cache.load(request.cache_key)
-        if not isinstance(df, pd.DataFrame):
-            raise HTTPException(status_code=400, detail="Cached data is not a DataFrame")
+    # --- Obtain column metadata (fast, already in memory) -----------------
+    col_meta = disk_cache.get_column_meta(request.cache_key)
 
-    if request.target_column not in df.columns:
+    # If metadata isn't in memory yet (e.g. server restart), reload from manifest
+    if col_meta is None and disk_cache.is_modular(request.cache_key):
+        try:
+            disk_cache._load_manifest_into_meta(request.cache_key)
+            col_meta = disk_cache.get_column_meta(request.cache_key)
+        except Exception:
+            pass
+
+    if col_meta is None:
+        raise HTTPException(status_code=400, detail="Column metadata not available for this cache key")
+
+    columns_info: List[Dict[str, Any]] = col_meta.get("columns", [])
+    total_rows: int = col_meta.get("total_rows", 0)
+    col_names = {c["name"] for c in columns_info}
+
+    if request.target_column not in col_names:
         raise HTTPException(status_code=400, detail=f"Target column not found: {request.target_column}")
 
-    total_scanned = len([c for c in df.columns if c != request.target_column])
+    feature_columns = [c for c in columns_info if c["name"] != request.target_column]
+    total_scanned = len(feature_columns)
     suspicious: List[Dict[str, str]] = []
 
-    # 1. Known PPMI leakage list
+    # 1. Known PPMI leakage list -------------------------------------------
     try:
         from config.constants import LEAKAGE_FEATURES as KNOWN_LEAKAGE
     except ImportError:
         try:
             import sys
             pie_config = Path(__file__).resolve().parent.parent.parent / "lib" / "PIE"
-            sys.path.insert(0, str(pie_config))
+            if str(pie_config) not in sys.path:
+                sys.path.insert(0, str(pie_config))
             from config.constants import LEAKAGE_FEATURES as KNOWN_LEAKAGE
         except Exception:
             KNOWN_LEAKAGE = []
 
     known_set = set(KNOWN_LEAKAGE)
-    for col in df.columns:
-        if col == request.target_column:
-            continue
-        if col in known_set:
-            suspicious.append({"name": col, "reason": "known_leakage", "detail": "In PPMI known leakage list"})
+    for col_info in feature_columns:
+        if col_info["name"] in known_set:
+            suspicious.append({
+                "name": col_info["name"],
+                "reason": "known_leakage",
+                "detail": "In PPMI known leakage list",
+            })
 
-    # 2. ID-like columns
+    # 2. ID-like columns ---------------------------------------------------
     id_pattern = re.compile(r'(?:_ID$|^PATNO$|^EVENT_ID$|^SUBJECT_ID$|^SAMPLE_ID$)', re.IGNORECASE)
-    for col in df.columns:
-        if col == request.target_column:
-            continue
-        if col in known_set:
-            continue  # already flagged
-        if id_pattern.search(col) or df[col].nunique() == len(df):
-            suspicious.append({"name": col, "reason": "identifier", "detail": f"Unique count ({df[col].nunique()}) equals row count ({len(df)})" if df[col].nunique() == len(df) else f"Column name matches ID pattern"})
-
-    # 3. High target correlation (numeric features only)
-    target = df[request.target_column]
-    if not np.issubdtype(target.dtype, np.number):
-        from sklearn.preprocessing import LabelEncoder
-        try:
-            target_encoded = pd.Series(LabelEncoder().fit_transform(target.dropna()), index=target.dropna().index)
-        except Exception:
-            target_encoded = None
-    else:
-        target_encoded = target
-
     already_flagged = {s["name"] for s in suspicious}
+    for col_info in feature_columns:
+        name = col_info["name"]
+        if name in already_flagged:
+            continue
+        unique_count = col_info.get("unique_count", 0)
+        is_id_name = bool(id_pattern.search(name))
+        is_id_cardinality = total_rows > 0 and unique_count == total_rows
+        if is_id_name or is_id_cardinality:
+            if is_id_cardinality:
+                detail = f"Unique count ({unique_count}) equals row count ({total_rows})"
+            else:
+                detail = "Column name matches ID pattern"
+            suspicious.append({"name": name, "reason": "identifier", "detail": detail})
 
-    if target_encoded is not None:
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
-            if col == request.target_column or col in already_flagged:
-                continue
+    # 3. Near-zero variance ------------------------------------------------
+    already_flagged = {s["name"] for s in suspicious}
+    for col_info in feature_columns:
+        name = col_info["name"]
+        if name in already_flagged:
+            continue
+        unique_count = col_info.get("unique_count", 0)
+        # If only 1 unique value, it's constant (100 % same value)
+        if unique_count <= 1 and total_rows > 0:
+            suspicious.append({
+                "name": name,
+                "reason": "near_zero_variance",
+                "detail": "Constant column (1 unique value)",
+            })
+        # Very low cardinality relative to rows → likely near-zero variance
+        elif total_rows > 100 and unique_count == 2:
+            null_pct = col_info.get("null_pct", 0)
+            if null_pct > 99.5:
+                suspicious.append({
+                    "name": name,
+                    "reason": "near_zero_variance",
+                    "detail": f"{null_pct}% null values",
+                })
+
+    # 4. High target correlation (optional — needs raw data) ---------------
+    # Try to load actual data for correlation analysis.  If the underlying
+    # parquet files are unavailable (e.g. modular cache with missing files),
+    # we skip this step rather than failing the whole scan.
+    try:
+        df: Optional[pd.DataFrame] = None
+        if disk_cache.is_modular(request.cache_key):
+            # Try loading target + numeric columns via load_columns
+            numeric_names = [
+                c["name"] for c in feature_columns
+                if c.get("is_numeric") and c["name"] not in {s["name"] for s in suspicious}
+            ]
+            cols_to_load = [request.target_column] + numeric_names[:200]  # Cap to avoid OOM
             try:
-                valid = df[col].notna() & target_encoded.reindex(df.index).notna()
-                if valid.sum() < 10:
-                    continue
-                x = df.loc[valid, col].values.astype(float)
-                y = target_encoded.reindex(df.index).loc[valid].values.astype(float)
-                # Point-biserial / Pearson correlation as a quick proxy
-                corr = np.abs(np.corrcoef(x, y)[0, 1])
-                if np.isnan(corr):
-                    continue
-                if corr > 0.95:
-                    suspicious.append({"name": col, "reason": "high_target_correlation", "detail": f"Absolute correlation with target: {corr:.3f}"})
-            except Exception:
-                continue
+                df = disk_cache.load_columns(request.cache_key, cols_to_load)
+            except (KeyError, Exception):
+                df = None
+        else:
+            raw = disk_cache.load(request.cache_key)
+            df = raw if isinstance(raw, pd.DataFrame) else None
 
-    # 4. Near-zero variance
-    already_flagged = {s["name"] for s in suspicious}
-    for col in df.columns:
-        if col == request.target_column or col in already_flagged:
-            continue
-        try:
-            top_freq = df[col].value_counts(normalize=True).iloc[0] if len(df[col].value_counts()) > 0 else 0
-            if top_freq > 0.995:
-                suspicious.append({"name": col, "reason": "near_zero_variance", "detail": f"{top_freq*100:.1f}% same value"})
-        except Exception:
-            continue
+        if df is not None and request.target_column in df.columns:
+            target = df[request.target_column]
+            if not np.issubdtype(target.dtype, np.number):
+                from sklearn.preprocessing import LabelEncoder
+                try:
+                    target_encoded = pd.Series(
+                        LabelEncoder().fit_transform(target.dropna()),
+                        index=target.dropna().index,
+                    )
+                except Exception:
+                    target_encoded = None
+            else:
+                target_encoded = target
+
+            if target_encoded is not None:
+                already_flagged = {s["name"] for s in suspicious}
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                for col in numeric_cols:
+                    if col == request.target_column or col in already_flagged:
+                        continue
+                    try:
+                        valid = df[col].notna() & target_encoded.reindex(df.index).notna()
+                        if valid.sum() < 10:
+                            continue
+                        x = df.loc[valid, col].values.astype(float)
+                        y = target_encoded.reindex(df.index).loc[valid].values.astype(float)
+                        corr = np.abs(np.corrcoef(x, y)[0, 1])
+                        if np.isnan(corr):
+                            continue
+                        if corr > 0.95:
+                            suspicious.append({
+                                "name": col,
+                                "reason": "high_target_correlation",
+                                "detail": f"Absolute correlation with target: {corr:.3f}",
+                            })
+                    except Exception:
+                        continue
+            del df
+            gc.collect()
+    except Exception:
+        pass  # Correlation check is best-effort
 
     elapsed = time.time() - start
 

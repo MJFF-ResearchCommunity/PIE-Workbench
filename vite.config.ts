@@ -18,7 +18,14 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     watch: {
-      ignored: ['**/backend/venv/**', '**/node_modules/**', '**/.git/**'],
+      ignored: [
+        '**/backend/**',
+        '**/node_modules/**',
+        '**/.git/**',
+        '**/lib/**',
+        '**/release/**',
+        '**/dist/**',
+      ],
     },
   },
 })

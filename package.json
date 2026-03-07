@@ -10,7 +10,7 @@
     "build": "tsc && vite build",
     "build:electron": "npm run build && electron-builder",
     "preview": "vite preview",
-    "backend": "cd backend && python -m uvicorn main:app --reload --port 8100",
+    "backend": "cd backend && python3 -m uvicorn main:app --reload --port 8100",
     "start": "concurrently \"npm run backend\" \"npm run dev\""
   },
   "dependencies": {
