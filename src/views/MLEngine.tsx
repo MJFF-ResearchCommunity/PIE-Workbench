@@ -426,6 +426,7 @@ export default function MLEngine() {
     try {
       const response = await analysisApi.featureEngineering({
         cache_key: data.cacheKey,
+        target_column: targetColumn,
         scale_numeric: true,
         one_hot_encode: true,
       });

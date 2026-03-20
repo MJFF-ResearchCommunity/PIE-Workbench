@@ -18,6 +18,7 @@ export const projectApi = {
   load: (filePath: string) => api.post(`/project/load?file_path=${encodeURIComponent(filePath)}`),
   updateState: (updates: Record<string, unknown>) => api.post('/project/update_state', updates),
   getDiseaseContexts: () => api.get('/project/disease_contexts'),
+  getRecent: () => api.get('/project/recent'),
 };
 
 // Data API
@@ -89,6 +90,7 @@ export interface DataLoadRequest {
 
 export interface FeatureEngineeringRequest {
   cache_key: string;
+  target_column?: string;
   scale_numeric?: boolean;
   one_hot_encode?: boolean;
   max_categories?: number;

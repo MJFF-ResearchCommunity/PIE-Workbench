@@ -2,9 +2,18 @@
 ML Analysis API endpoints.
 
 Handles feature engineering, selection, and model training using PIE + endgame.
+
+The analysis pipeline mirrors PIE's ``pipeline.py``:
+
+  1. Data Reduction   — DataReducer (analyze → drop → merge → consolidate COHORT)
+  2. Feature Engineer — FeatureEngineer (OHE + scale)
+  3. Feature Select   — pipe-value resolution, drop non-numeric, split, FeatureSelector
+  4. Classification   — Classifier (compare → tune → predict)
 """
 
+import asyncio
 import gc
+import logging
 import os
 import re
 import time
@@ -19,6 +28,8 @@ import pandas as pd
 import numpy as np
 
 from . import cache as disk_cache
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -47,6 +58,7 @@ def _update_task(task_id: str, **kwargs):
 class FeatureEngineeringRequest(BaseModel):
     """Request for feature engineering."""
     cache_key: str
+    target_column: Optional[str] = None
     scale_numeric: bool = True
     one_hot_encode: bool = True
     max_categories: int = 25
@@ -311,115 +323,177 @@ async def start_feature_engineering(request: FeatureEngineeringRequest, backgrou
 
 
 async def _feature_engineering_task(task_id: str, request: FeatureEngineeringRequest):
-    """Background task for feature engineering."""
+    """Background task for feature engineering.
+
+    Follows PIE's ``pipeline.py`` steps 1-2:
+      1. Load raw data → DataReducer (analyze → drop → merge → consolidate COHORT)
+      2. FeatureEngineer (OHE + scale)
+
+    DataReducer is the critical step: it drops hundreds of low-signal columns
+    (>95% missing, metadata, single-value, near-zero-variance) **before** merging,
+    keeping memory manageable.
+    """
+    loop = asyncio.get_event_loop()
+
     try:
-        _update_task(task_id, status="running", progress=0.1)
+        _update_task(task_id, status="running", progress=0.05,
+                     message="Starting data reduction & feature engineering (PIE pipeline)...")
 
-        # Load data — modular-aware
-        if disk_cache.is_modular(request.cache_key):
-            _update_task(task_id, message="Loading modalities from modular cache...")
+        # Determine the data path from the active project
+        from .project import _current_project
+        data_path = _current_project.config.data_path if _current_project else None
+        if not data_path or not os.path.isdir(data_path):
+            raise ValueError(
+                "No project loaded or data path is invalid. "
+                "Create/open a project first."
+            )
 
-            if request.modalities:
-                # Load specific requested modalities
-                df = disk_cache.load_modalities(request.cache_key, request.modalities)
-            else:
-                # Default: load all non-biospecimen modalities (manageable column count)
-                all_files = disk_cache.list_modality_files(request.cache_key)
-                non_bio = [f for f in all_files if not f.startswith("biospecimen__")]
-                if non_bio:
-                    df = disk_cache.load_modalities(request.cache_key, non_bio)
-                else:
-                    df = disk_cache.load_modalities(request.cache_key, all_files)
-        else:
-            data = disk_cache.load(request.cache_key)
-            df = data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame()
-            del data
-            gc.collect()
+        # ---------------------------------------------------------------
+        # Step 1a: Load raw data via PIE-clean (same as PIE's pipeline)
+        # ---------------------------------------------------------------
+        _update_task(task_id, progress=0.08,
+                     message="Loading raw PPMI data via PIE-clean DataLoader...")
 
-        _update_task(task_id, message=f"Loaded data: {df.shape[0]:,} rows x {df.shape[1]} columns")
+        from pie_clean import DataLoader, ALL_MODALITIES
 
-        # The disk cache downcasts low-cardinality object columns to pandas
-        # Categorical to save memory.  FeatureEngineer needs to insert new
-        # values (e.g. _OTHER_) which is illegal on a Categorical without
-        # first adding the category.  Convert them back to object here.
-        cat_cols = df.select_dtypes(include=["category"]).columns
-        if len(cat_cols):
-            df[cat_cols] = df[cat_cols].astype(object)
-            _update_task(task_id, message=f"Converted {len(cat_cols)} categorical columns back to object for engineering")
+        modalities = request.modalities or [
+            "subject_characteristics", "medical_history",
+            "motor_assessments", "non_motor_assessments",
+        ]
+
+        def _load():
+            return DataLoader.load(
+                data_path=data_path,
+                merge_output=False,
+                modalities=modalities,
+                clean_data=True,
+            )
+
+        data_dict = await loop.run_in_executor(None, _load)
+
+        table_count = sum(
+            len(v) if isinstance(v, dict) else 1
+            for v in data_dict.values()
+            if isinstance(v, (pd.DataFrame, dict))
+        )
+        _update_task(task_id, progress=0.25,
+                     message=f"Loaded {table_count} tables across {len(modalities)} modalities")
+
+        # ---------------------------------------------------------------
+        # Step 1b: DataReducer — analyze, drop, merge, consolidate COHORT
+        # ---------------------------------------------------------------
+        _update_task(task_id, message="Running DataReducer (analyzing columns)...")
+
+        from pie.data_reducer import DataReducer
+
+        reducer = DataReducer(data_dict)
+        analysis = await loop.run_in_executor(None, reducer.analyze)
+        drops = reducer.get_drop_suggestions(analysis)
+
+        total_drops = sum(len(v) for v in drops.values())
+        _update_task(task_id, progress=0.35,
+                     message=f"DataReducer: dropping {total_drops} low-signal columns")
+
+        reduced_dict = reducer.apply_drops(drops)
+        del data_dict
+        gc.collect()
+
+        _update_task(task_id, progress=0.40, message="Merging reduced data...")
+
+        merged_df = await loop.run_in_executor(
+            None, lambda: reducer.merge_reduced_data(reduced_dict, output_filename=None)
+        )
+        del reduced_dict
+        gc.collect()
+
+        if merged_df.empty:
+            raise ValueError("DataReducer produced an empty DataFrame after merge — check your data path")
+
+        _update_task(task_id, progress=0.45,
+                     message=f"Merged: {merged_df.shape[0]:,} rows x {merged_df.shape[1]} cols")
+
+        # Consolidate COHORT columns (PIE pipeline step)
+        target = request.target_column or "COHORT"
+        cohort_cols = [c for c in merged_df.columns if "COHORT" in c.upper()]
+        if cohort_cols:
+            _update_task(task_id, message=f"Consolidating {len(cohort_cols)} COHORT columns...")
+            merged_df = reducer.consolidate_cohort_columns(merged_df, target_cohort_col_name=target)
+            _update_task(task_id, progress=0.50,
+                         message=f"After COHORT consolidation: {merged_df.shape[0]:,} rows x {merged_df.shape[1]} cols")
+
+        if target and target not in merged_df.columns:
+            raise ValueError(
+                f"Target column '{target}' not found after reduction & COHORT consolidation. "
+                f"Available COHORT-like columns were: {cohort_cols}"
+            )
+
+        # ---------------------------------------------------------------
+        # Step 2: Feature Engineering
+        # ---------------------------------------------------------------
+        original_shape = list(merged_df.shape)
 
         try:
             from pie.feature_engineer import FeatureEngineer
 
-            _update_task(task_id, message="Applying feature engineering...", progress=0.3)
+            _update_task(task_id, progress=0.55, message="Applying FeatureEngineer...")
 
-            engineer = FeatureEngineer(df)
+            engineer = FeatureEngineer(merged_df)
 
             if request.one_hot_encode:
                 _update_task(task_id, message="One-hot encoding categorical features...")
+                ignore_cols = [target] if target else []
                 engineer.one_hot_encode(
                     auto_identify_threshold=20,
                     max_categories_to_encode=request.max_categories,
-                    min_frequency_for_category=request.min_frequency
+                    min_frequency_for_category=request.min_frequency,
+                    ignore_for_ohe=ignore_cols,
                 )
 
-            _update_task(task_id, progress=0.6)
-
             if request.scale_numeric:
-                _update_task(task_id, message="Scaling numeric features...")
-                engineer.scale_numeric_features(scaler_type='standard')
-
-            _update_task(task_id, progress=0.8)
+                _update_task(task_id, progress=0.75, message="Scaling numeric features...")
+                engineer.scale_numeric_features(scaler_type="standard")
 
             engineered_df = engineer.get_dataframe()
             summary = engineer.get_engineered_feature_summary()
 
-            # Cache the engineered data to disk
-            new_cache_key = f"engineered_{task_id}"
-            original_shape = list(df.shape)
-            new_shape = list(engineered_df.shape)
-            _update_task(task_id, message=f"Caching engineered data ({new_shape[0]:,} rows x {new_shape[1]} columns)...")
-            disk_cache.store(new_cache_key, engineered_df)
-            del engineered_df, df
-            gc.collect()
-
-            _update_task(
-                task_id,
-                status="completed", progress=1.0,
-                message="Feature engineering completed",
-                result={
-                    "cache_key": new_cache_key,
-                    "original_shape": original_shape,
-                    "new_shape": new_shape,
-                    "summary": summary,
-                },
-            )
-
         except ImportError:
-            # Fallback: basic feature engineering
-            _update_task(task_id, message="Using basic feature engineering (PIE not available)...")
+            _update_task(task_id, message="PIE FeatureEngineer not available — basic OHE fallback...")
+            engineered_df = merged_df
+            cat_cols = engineered_df.select_dtypes(include=["object", "category"]).columns
+            for col in cat_cols:
+                if col == target:
+                    continue
+                if engineered_df[col].nunique() <= request.max_categories:
+                    dummies = pd.get_dummies(engineered_df[col], prefix=col)
+                    engineered_df = pd.concat([engineered_df.drop(col, axis=1), dummies], axis=1)
+            summary = {}
 
-            # Simple one-hot encoding
-            categorical_cols = df.select_dtypes(include=['object', 'category']).columns
-            for col in categorical_cols:
-                if df[col].nunique() <= request.max_categories:
-                    dummies = pd.get_dummies(df[col], prefix=col)
-                    df = pd.concat([df.drop(col, axis=1), dummies], axis=1)
+        # ---------------------------------------------------------------
+        # Cache result
+        # ---------------------------------------------------------------
+        new_cache_key = f"engineered_{task_id}"
+        new_shape = list(engineered_df.shape)
+        _update_task(task_id, progress=0.90,
+                     message=f"Caching engineered data ({new_shape[0]:,} rows x {new_shape[1]} cols)...")
+        disk_cache.store(new_cache_key, engineered_df)
+        del engineered_df, merged_df
+        gc.collect()
 
-            new_cache_key = f"engineered_{task_id}"
-            new_shape = list(df.shape)
-            disk_cache.store(new_cache_key, df)
-            del df
-            gc.collect()
-
-            _update_task(
-                task_id,
-                status="completed", progress=1.0,
-                message="Basic feature engineering completed",
-                result={"cache_key": new_cache_key, "new_shape": new_shape},
-            )
+        _update_task(
+            task_id,
+            status="completed", progress=1.0,
+            message="Feature engineering completed",
+            result={
+                "cache_key": new_cache_key,
+                "original_shape": original_shape,
+                "new_shape": new_shape,
+                "summary": summary,
+            },
+        )
 
     except Exception as e:
-        _update_task(task_id, status="failed", error=str(e), message=f"Failed: {e}")
+        _update_task(task_id, status="failed", error=str(e) or repr(e),
+                     message=f"Failed: {e!r}")
 
 
 @router.post("/feature_selection")
@@ -447,7 +521,16 @@ async def start_feature_selection(request: FeatureSelectionRequest, background_t
 
 
 async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest):
-    """Background task for feature selection."""
+    """Background task for feature selection.
+
+    Mirrors PIE ``pipeline.py`` step 3:
+      - Remove leakage features
+      - Resolve remaining pipe-separated values (average numeric ones)
+      - Drop non-numeric columns
+      - fillna(0)
+      - train/test split (stratified)
+      - FeatureSelector fit/transform
+    """
     try:
         from sklearn.model_selection import train_test_split
         from sklearn.preprocessing import LabelEncoder
@@ -461,32 +544,84 @@ async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest
 
         _update_task(task_id, message=f"Loaded {df.shape[0]:,} rows x {df.shape[1]} columns")
 
-        # Remove leakage features
+        # Remove leakage features (never drop the target column)
         if request.leakage_features:
-            cols_to_drop = [c for c in request.leakage_features if c in df.columns]
+            cols_to_drop = [c for c in request.leakage_features if c in df.columns and c != request.target_column]
             df = df.drop(columns=cols_to_drop)
             _update_task(task_id, message=f"Removed {len(cols_to_drop)} leakage features")
 
-        _update_task(task_id, progress=0.3, message="Preparing features and target...")
+        _update_task(task_id, progress=0.2, message="Preparing features and target...")
 
-        # Prepare features and target
+        if request.target_column not in df.columns:
+            ohe_cols = [c for c in df.columns if c.startswith(f"{request.target_column}_")]
+            if ohe_cols:
+                raise ValueError(
+                    f"Target column '{request.target_column}' was one-hot encoded during feature engineering "
+                    f"(found: {ohe_cols[:5]}). Re-run feature engineering with target_column set to preserve it."
+                )
+            raise ValueError(
+                f"Target column '{request.target_column}' not found in engineered data. "
+                f"Available columns ({len(df.columns)}): {list(df.columns[:20])}"
+            )
+
         df = df.dropna(subset=[request.target_column])
 
-        id_cols = ['PATNO', 'EVENT_ID']
+        if "PATNO" in df.columns:
+            try:
+                df["PATNO"] = df["PATNO"].astype(int)
+            except (ValueError, TypeError):
+                pass
+
+        id_cols = ["PATNO", "EVENT_ID"]
         feature_cols = [c for c in df.columns if c not in [request.target_column] + id_cols]
 
-        X = df[feature_cols].select_dtypes(include=[np.number])
+        X = df[feature_cols].copy()
         y = df[request.target_column]
 
-        _update_task(task_id, message=f"Numeric features: {X.shape[1]}, target classes: {y.nunique()}")
+        # ----- Resolve remaining pipe-separated values (PIE pipeline.py L270-319) -----
+        _ID_DATE_PATS = ["ID", "DATE", "TIME", "PATNO", "EVENT"]
+        pipe_resolved = 0
+        for col in X.select_dtypes(include=["object"]).columns:
+            if any(p in col.upper() for p in _ID_DATE_PATS):
+                continue
+            if not X[col].astype(str).str.contains(r"\|", na=False).any():
+                continue
 
-        # Encode target if categorical
+            def _avg_pipe(val):
+                if isinstance(val, str) and "|" in val:
+                    try:
+                        return np.mean([float(x) for x in val.split("|")])
+                    except (ValueError, TypeError):
+                        return np.nan
+                return val
+
+            converted = X[col].apply(_avg_pipe)
+            numeric = pd.to_numeric(converted, errors="coerce")
+            n_nonnull = X[col].notna().sum()
+            n_numeric = numeric.notna().sum()
+            if n_nonnull > 0 and (n_numeric / n_nonnull) > 0.9:
+                X[col] = numeric
+                pipe_resolved += 1
+
+        if pipe_resolved:
+            _update_task(task_id, message=f"Resolved pipe-separated values in {pipe_resolved} columns")
+
+        # Drop remaining non-numeric columns
+        non_numeric = X.select_dtypes(exclude=[np.number]).columns
+        if len(non_numeric):
+            _update_task(task_id, message=f"Dropping {len(non_numeric)} non-numeric columns")
+            X = X.drop(columns=non_numeric)
+
+        X = X.fillna(0)
+
+        _update_task(task_id, progress=0.35,
+                     message=f"Numeric features: {X.shape[1]}, target classes: {y.nunique()}")
+
         le = LabelEncoder()
         y_encoded = le.fit_transform(y)
 
-        _update_task(task_id, progress=0.5, message="Splitting train/test...")
+        _update_task(task_id, progress=0.4, message="Splitting train/test...")
 
-        # Split data
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=request.test_size, random_state=42, stratify=y_encoded
         )
@@ -494,61 +629,58 @@ async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest
         _update_task(task_id, message=f"Train: {X_train.shape[0]:,} rows, Test: {X_test.shape[0]:,} rows")
 
         if request.method == "none":
-            # Skip feature selection entirely — pass all features through
-            _update_task(task_id, message="Skipping feature selection (none) — keeping all features")
-            X_train_selected = X_train.fillna(0)
-            X_test_selected = X_test.fillna(0)
+            _update_task(task_id, message="Skipping feature selection — keeping all features")
+            X_train_selected = X_train
+            X_test_selected = X_test
             selected_features = list(X_train.columns)
         else:
             try:
                 from pie.feature_selector import FeatureSelector
 
-                _update_task(task_id, message=f"Applying {request.method} feature selection...")
+                _update_task(task_id, progress=0.55,
+                             message=f"Applying {request.method} feature selection...")
 
                 selector = FeatureSelector(
                     method=request.method,
-                    task_type='classification',
-                    k_or_frac=request.param_value if request.method == 'k_best' else None,
-                    alpha_fdr=request.param_value if request.method == 'fdr' else 0.05
+                    task_type="classification",
+                    k_or_frac=request.param_value if request.method == "k_best" else None,
+                    alpha_fdr=request.param_value if request.method == "fdr" else 0.05,
                 )
 
-                selector.fit(X_train.fillna(0), le.fit_transform(y_train))
-                X_train_selected = selector.transform(X_train.fillna(0))
-                X_test_selected = selector.transform(X_test.fillna(0))
-
+                y_train_enc = le.fit_transform(y_train)
+                selector.fit(X_train, y_train_enc)
+                X_train_selected = selector.transform(X_train)
+                X_test_selected = selector.transform(X_test)
                 selected_features = selector.selected_feature_names_
 
             except ImportError:
-                # Fallback: variance threshold
                 from sklearn.feature_selection import VarianceThreshold
                 _update_task(task_id, message="PIE FeatureSelector not available, using VarianceThreshold fallback...")
 
-                selector = VarianceThreshold(threshold=0.01)
+                vt = VarianceThreshold(threshold=0.01)
                 X_train_selected = pd.DataFrame(
-                    selector.fit_transform(X_train.fillna(0)),
-                    columns=X_train.columns[selector.get_support()]
+                    vt.fit_transform(X_train), columns=X_train.columns[vt.get_support()]
                 )
                 X_test_selected = pd.DataFrame(
-                    selector.transform(X_test.fillna(0)),
-                    columns=X_train.columns[selector.get_support()]
+                    vt.transform(X_test), columns=X_train.columns[vt.get_support()]
                 )
                 selected_features = list(X_train_selected.columns)
 
-        _update_task(task_id, progress=0.8, message=f"Selected {len(selected_features)} features from {len(feature_cols)} original")
+        _update_task(task_id, progress=0.8,
+                     message=f"Selected {len(selected_features)} features from {X.shape[1]}")
 
-        # Combine with target
         train_df = pd.concat([X_train_selected.reset_index(drop=True), y_train.reset_index(drop=True)], axis=1)
         test_df = pd.concat([X_test_selected.reset_index(drop=True), y_test.reset_index(drop=True)], axis=1)
 
-        # Cache results to disk
         train_cache_key = f"train_{task_id}"
         test_cache_key = f"test_{task_id}"
-        train_shape = list(train_df.shape)
-        test_shape = list(test_df.shape)
         _update_task(task_id, message="Caching train/test splits to disk...")
         disk_cache.store(train_cache_key, train_df)
         disk_cache.store(test_cache_key, test_df)
-        del train_df, test_df
+
+        train_shape = list(train_df.shape)
+        test_shape = list(test_df.shape)
+        del train_df, test_df, X, df
         gc.collect()
 
         _update_task(
@@ -567,7 +699,8 @@ async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest
         )
 
     except Exception as e:
-        _update_task(task_id, status="failed", error=str(e), message=f"Failed: {e}")
+        _update_task(task_id, status="failed", error=str(e) or repr(e),
+                     message=f"Failed: {e!r}")
 
 
 @router.post("/train")
@@ -668,7 +801,7 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
                          message="Failed: endgame/PIE Classifier not available")
 
     except Exception as e:
-        _update_task(task_id, status="failed", error=str(e), message=f"Failed: {e}")
+        _update_task(task_id, status="failed", error=str(e) or repr(e), message=f"Failed: {e!r}")
 
 
 @router.post("/auto_ml")
@@ -737,7 +870,7 @@ async def _auto_ml_task(task_id: str, request: AutoMLRequest):
         _update_task(task_id, status="failed", error="endgame-ml not installed",
                      message="Failed: endgame-ml is required for AutoML. Install with: pip install endgame-ml[tabular]")
     except Exception as e:
-        _update_task(task_id, status="failed", error=str(e), message=f"Failed: {e}")
+        _update_task(task_id, status="failed", error=str(e) or repr(e), message=f"Failed: {e!r}")
 
 
 @router.post("/calibrate")
@@ -785,7 +918,7 @@ async def _calibrate_task(task_id: str, request: CalibrateRequest):
         )
 
     except Exception as e:
-        _update_task(task_id, status="failed", error=str(e), message=f"Failed: {e}")
+        _update_task(task_id, status="failed", error=str(e) or repr(e), message=f"Failed: {e!r}")
 
 
 @router.post("/validate_drift")
@@ -827,7 +960,7 @@ async def _drift_validation_task(task_id: str, request: DriftValidationRequest):
         _update_task(task_id, status="failed", error="endgame-ml required for drift validation",
                      message="Failed: endgame-ml is required for drift validation")
     except Exception as e:
-        _update_task(task_id, status="failed", error=str(e), message=f"Failed: {e}")
+        _update_task(task_id, status="failed", error=str(e) or repr(e), message=f"Failed: {e!r}")
 
 
 @router.post("/detect_leakage")
@@ -1048,7 +1181,7 @@ async def _create_ensemble_task(task_id: str, request: EnsembleRequest):
         )
 
     except Exception as e:
-        _update_task(task_id, status="failed", error=str(e), message=f"Failed: {e}")
+        _update_task(task_id, status="failed", error=str(e) or repr(e), message=f"Failed: {e!r}")
 
 
 @router.post("/run_pipeline")

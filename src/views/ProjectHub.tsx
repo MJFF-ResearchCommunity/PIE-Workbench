@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { 
@@ -8,7 +8,8 @@ import {
   Database,
   Brain,
   BarChart3,
-  Sparkles
+  Sparkles,
+  Clock
 } from 'lucide-react';
 import Card, { CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/Card';
 import Button from '../components/ui/Button';
@@ -37,6 +38,7 @@ export default function ProjectHub() {
     { id: 'alzheimers', name: "Alzheimer's Disease", available: false },
   ]);
   const [loading, setLoading] = useState(false);
+  const [recentProjects, setRecentProjects] = useState<Array<{ path: string; name: string; last_opened: string }>>([]);
   
   // Form state
   const [projectName, setProjectName] = useState('');
@@ -46,9 +48,19 @@ export default function ProjectHub() {
   // Check if running in Electron
   const isElectron = Boolean(window.electronAPI);
 
+  const loadRecentProjects = useCallback(async () => {
+    try {
+      const response = await projectApi.getRecent();
+      setRecentProjects(response.data.projects || []);
+    } catch {
+      // API not yet available — that's fine
+    }
+  }, []);
+
   useEffect(() => {
     loadDiseaseContexts();
-  }, []);
+    loadRecentProjects();
+  }, [loadRecentProjects]);
 
   const loadDiseaseContexts = async () => {
     try {
@@ -117,30 +129,79 @@ export default function ProjectHub() {
     }
   };
 
+  const restoreProject = async (path: string) => {
+    try {
+      setLoading(true);
+      const response = await projectApi.load(path);
+      const proj = response.data.project;
+
+      setProject({
+        name: proj.config.name,
+        diseaseContext: proj.config.disease_context,
+        dataPath: proj.config.data_path,
+        outputPath: proj.config.output_path,
+        targetColumn: proj.config.target_column || '',
+        leakageFeatures: proj.config.leakage_features || [],
+      });
+
+      // Restore data state
+      if (proj.data) {
+        const { setData } = useStore.getState();
+        setData({
+          loaded: proj.data.loaded || false,
+          cacheKey: proj.data.cache_key || null,
+          shape: proj.data.shape || null,
+          columns: proj.data.columns || [],
+          modalities: proj.data.modalities || [],
+        });
+      }
+
+      // Restore analysis state
+      if (proj.analysis) {
+        const { setAnalysis } = useStore.getState();
+        setAnalysis({
+          engineeredCacheKey: proj.analysis.engineered_cache_key || null,
+          trainCacheKey: proj.analysis.train_cache_key || null,
+          testCacheKey: proj.analysis.test_cache_key || null,
+          modelId: proj.analysis.model_id || null,
+          selectedFeatures: proj.analysis.selected_features || [],
+          calibratedModelId: proj.analysis.calibrated_model_id || null,
+          ensembleModelId: proj.analysis.ensemble_model_id || null,
+          driftResult: proj.analysis.drift_result || null,
+        });
+      }
+
+      addToast('Project loaded successfully!', 'success');
+      // Navigate to where the user left off
+      const step = proj.current_step || 'data_ingestion';
+      const stepRoutes: Record<string, string> = {
+        project_hub: '/data',
+        data_ingestion: '/data',
+        ml_engine: '/ml',
+        stats_lab: '/stats',
+        results: '/results',
+      };
+      navigate(stepRoutes[step] || '/data');
+    } catch {
+      addToast('Failed to load project', 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleOpenProject = async () => {
     if (window.electronAPI) {
       const path = await window.electronAPI.selectFile({
         filters: [{ name: 'PIE Project', extensions: ['pie', 'json'] }],
       });
       if (path) {
-        try {
-          setLoading(true);
-          const response = await projectApi.load(path);
-          setProject({
-            name: response.data.project.config.name,
-            diseaseContext: response.data.project.config.disease_context,
-            dataPath: response.data.project.config.data_path,
-            outputPath: response.data.project.config.output_path,
-            targetColumn: response.data.project.config.target_column || '',
-            leakageFeatures: response.data.project.config.leakage_features || [],
-          });
-          addToast('Project loaded successfully!', 'success');
-          navigate('/data');
-        } catch {
-          addToast('Failed to load project', 'error');
-        } finally {
-          setLoading(false);
-        }
+        await restoreProject(path);
+      }
+    } else {
+      // Browser mode: prompt for path
+      const path = prompt('Enter the full path to your .pie project file:');
+      if (path) {
+        await restoreProject(path);
       }
     }
   };
@@ -231,6 +292,42 @@ export default function ProjectHub() {
             </Card>
           </motion.div>
         </div>
+
+        {/* Recent Projects */}
+        {recentProjects.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.4, delay: 0.35 }}
+            className="w-full max-w-xl mb-12"
+          >
+            <div className="flex items-center gap-2 mb-3 px-1">
+              <Clock className="w-4 h-4 text-pie-text-muted" />
+              <span className="text-sm font-medium text-pie-text-muted">Recent Projects</span>
+            </div>
+            <div className="space-y-2">
+              {recentProjects.slice(0, 5).map((proj) => (
+                <button
+                  key={proj.path}
+                  onClick={() => restoreProject(proj.path)}
+                  disabled={loading}
+                  className="w-full flex items-center gap-3 p-3 rounded-lg bg-pie-surface/60 border border-pie-border/50 hover:border-pie-accent/40 hover:bg-pie-surface transition-colors text-left group"
+                >
+                  <FolderOpen className="w-4 h-4 text-pie-accent-secondary flex-shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-pie-text truncate group-hover:text-pie-accent transition-colors">
+                      {proj.name}
+                    </p>
+                    <p className="text-xs text-pie-text-muted truncate">{proj.path}</p>
+                  </div>
+                  <span className="text-xs text-pie-text-muted flex-shrink-0">
+                    {new Date(proj.last_opened).toLocaleDateString()}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </motion.div>
+        )}
 
         {/* Features Grid */}
         <motion.div

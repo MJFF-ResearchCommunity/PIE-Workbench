@@ -212,6 +212,7 @@ PIE-Workbench/
 
 ## Modular Design
 
+
 PIE Workbench uses the Adapter Pattern to support future diseases and data sources:
 
 ```python

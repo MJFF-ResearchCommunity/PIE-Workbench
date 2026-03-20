@@ -58,9 +58,15 @@ def downcast_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], downcast="integer")
         elif col_dtype == object and n_rows > 0:
             n_unique = df[col].nunique()
-            # Categoricals save memory when cardinality < 50 % of row count
             if n_unique < n_rows * 0.5:
-                df[col] = df[col].astype("category")
+                try:
+                    # Ensure all values are strings before converting to
+                    # category — mixed float/str values from pipe-separation
+                    # can cause Parquet serialization failures.
+                    df[col] = df[col].where(df[col].isna(), df[col].astype(str))
+                    df[col] = df[col].astype("category")
+                except Exception:
+                    pass  # Leave as object if conversion fails
     return df
 
 

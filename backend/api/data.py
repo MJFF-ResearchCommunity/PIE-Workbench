@@ -21,6 +21,8 @@ import psutil
 
 from . import cache as disk_cache
 
+logger = logging.getLogger(__name__)
+
 # Import PIE-clean constants (loader functions imported lazily inside the task)
 try:
     from pie_clean import ALL_MODALITIES
@@ -278,6 +280,64 @@ def _prefix_columns(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     return df.rename(columns=rename)
 
 
+_ID_DATE_PATTERNS = frozenset(["ID", "DATE", "TIME", "PATNO", "EVENT", "REC_ID", "ORIG_ENTRY"])
+
+
+def _resolve_pipe_separated_values(df: pd.DataFrame, modality: str = "") -> pd.DataFrame:
+    """Resolve pipe-separated values produced by PIE-clean's deduplication.
+
+    PIE-clean joins conflicting values with '|' when consolidating duplicate
+    (PATNO, EVENT_ID) rows.  This mirrors the resolution logic from the PIE
+    library's pipeline (pipeline.py lines 270-319):
+
+      * Numeric pipe values (e.g. '51.6|53.0') are averaged → 52.3
+      * Non-numeric pipe values are left as the first element
+      * If >90% of a column's non-null values convert to numeric, the whole
+        column is cast to float64
+    """
+    obj_cols = df.select_dtypes(include=["object"]).columns
+    if obj_cols.empty:
+        return df
+
+    resolved_count = 0
+
+    for col in obj_cols:
+        upper_col = col.upper()
+        if any(pat in upper_col for pat in _ID_DATE_PATTERNS):
+            continue
+
+        has_pipe = df[col].astype(str).str.contains(r"\|", na=False)
+        if not has_pipe.any():
+            continue
+
+        def _average_pipe(val):
+            if isinstance(val, str) and "|" in val:
+                try:
+                    return np.mean([float(x) for x in val.split("|")])
+                except (ValueError, TypeError):
+                    return val.split("|")[0]
+            return val
+
+        converted = df[col].apply(_average_pipe)
+        numeric = pd.to_numeric(converted, errors="coerce")
+        n_nonnull = df[col].notna().sum()
+        n_numeric = numeric.notna().sum()
+
+        if n_nonnull > 0 and (n_numeric / n_nonnull) > 0.90:
+            df[col] = numeric
+            resolved_count += 1
+        else:
+            df[col] = converted
+            resolved_count += 1
+
+    if resolved_count > 0:
+        logger.info(
+            "%s: resolved pipe-separated values in %d column(s)",
+            modality or "unknown", resolved_count,
+        )
+    return df
+
+
 async def _load_data_task(
     task_id: str,
     data_path: str,
@@ -375,6 +435,14 @@ async def _load_data_task(
                 message=f"Memory baseline: {_format_size(mem_before)} used / {_format_size(total_mem)} total"
             )
 
+            # Always include subject_characteristics for PPMI — it contains
+            # essential metadata (COHORT, demographics) needed for classification.
+            if "subject_characteristics" not in modalities:
+                sc_folder = os.path.join(data_path, _MODALITY_FOLDERS["subject_characteristics"])
+                if os.path.exists(sc_folder):
+                    modalities = ["subject_characteristics"] + list(modalities)
+                    _update_task(task_id, message="Auto-including Subject Characteristics (contains COHORT & demographics)")
+
             total_modalities = len(modalities)
             cache_key = f"data_{task_id}"
 
@@ -403,6 +471,7 @@ async def _load_data_task(
                             df = await loop.run_in_executor(
                                 None, load_ppmi_subject_characteristics, folder_path
                             )
+                            df = _resolve_pipe_separated_values(df, display_name)
                             _collect_pairs(df, all_pairs)
                             n = disk_cache.store_modality(cache_key, modality, df)
                             total_columns += n
@@ -419,6 +488,7 @@ async def _load_data_task(
                             for table_name, tdf in med_dict.items():
                                 if not isinstance(tdf, pd.DataFrame) or tdf.empty:
                                     continue
+                                tdf = _resolve_pipe_separated_values(tdf, f"med_hist/{table_name}")
                                 _collect_pairs(tdf, all_pairs)
                                 prefixed = _prefix_columns(tdf, table_name)
                                 store_name = f"medical_history__{table_name}"
@@ -433,6 +503,7 @@ async def _load_data_task(
                             df = await loop.run_in_executor(
                                 None, load_ppmi_motor_assessments, folder_path
                             )
+                            df = _resolve_pipe_separated_values(df, display_name)
                             _collect_pairs(df, all_pairs)
                             n = disk_cache.store_modality(cache_key, modality, df)
                             total_columns += n
@@ -444,6 +515,7 @@ async def _load_data_task(
                             df = await loop.run_in_executor(
                                 None, load_ppmi_non_motor_assessments, folder_path
                             )
+                            df = _resolve_pipe_separated_values(df, display_name)
                             _collect_pairs(df, all_pairs)
                             n = disk_cache.store_modality(cache_key, modality, df)
                             total_columns += n
@@ -458,6 +530,7 @@ async def _load_data_task(
                             for source_name, sdf in bio_dict.items():
                                 if not isinstance(sdf, pd.DataFrame) or sdf.empty:
                                     continue
+                                sdf = _resolve_pipe_separated_values(sdf, f"biospecimen/{source_name}")
                                 _collect_pairs(sdf, all_pairs)
                                 prefixed = _prefix_columns(sdf, source_name)
                                 store_name = f"biospecimen__{source_name}"

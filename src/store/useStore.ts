@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { projectApi } from '../services/api';
 
 interface Toast {
   id: string;
@@ -66,6 +67,9 @@ interface AppStore {
   addToast: (message: string, type: Toast['type']) => void;
   removeToast: (id: string) => void;
   
+  // Persistence
+  saveProject: () => void;
+
   // Reset
   reset: () => void;
 }
@@ -96,22 +100,34 @@ export const useStore = create<AppStore>((set, get) => ({
   
   // Project
   project: null,
-  setProject: (project) => set({ project }),
-  updateProject: (updates) => set((state) => ({
-    project: state.project ? { ...state.project, ...updates } : null,
-  })),
-  
+  setProject: (project) => {
+    set({ project });
+    if (project) setTimeout(() => get().saveProject(), 0);
+  },
+  updateProject: (updates) => {
+    set((state) => ({
+      project: state.project ? { ...state.project, ...updates } : null,
+    }));
+    setTimeout(() => get().saveProject(), 0);
+  },
+
   // Data
   data: initialDataState,
-  setData: (data) => set((state) => ({
-    data: { ...state.data, ...data },
-  })),
-  
+  setData: (data) => {
+    set((state) => ({
+      data: { ...state.data, ...data },
+    }));
+    setTimeout(() => get().saveProject(), 0);
+  },
+
   // Analysis
   analysis: initialAnalysisState,
-  setAnalysis: (analysis) => set((state) => ({
-    analysis: { ...state.analysis, ...analysis },
-  })),
+  setAnalysis: (analysis) => {
+    set((state) => ({
+      analysis: { ...state.analysis, ...analysis },
+    }));
+    setTimeout(() => get().saveProject(), 0);
+  },
   
   // UI
   sidebarCollapsed: false,
@@ -146,6 +162,36 @@ export const useStore = create<AppStore>((set, get) => ({
     toasts: state.toasts.filter((t) => t.id !== id),
   })),
   
+  // Persistence — sync frontend state to backend, which auto-saves to .pie
+  saveProject: () => {
+    const state = get();
+    if (!state.project) return;
+    projectApi.updateState({
+      config: {
+        target_column: state.project.targetColumn,
+        leakage_features: state.project.leakageFeatures,
+      },
+      data: {
+        loaded: state.data.loaded,
+        cache_key: state.data.cacheKey,
+        shape: state.data.shape,
+        columns: state.data.columns,
+        modalities: state.data.modalities,
+      },
+      analysis: {
+        engineered_cache_key: state.analysis.engineeredCacheKey,
+        train_cache_key: state.analysis.trainCacheKey,
+        test_cache_key: state.analysis.testCacheKey,
+        model_id: state.analysis.modelId,
+        selected_features: state.analysis.selectedFeatures,
+        calibrated_model_id: state.analysis.calibratedModelId,
+        ensemble_model_id: state.analysis.ensembleModelId,
+        drift_result: state.analysis.driftResult,
+      },
+      current_step: state.currentStep,
+    }).catch(() => {}); // Best-effort
+  },
+
   // Reset
   reset: () => set({
     currentStep: 'project_hub',
