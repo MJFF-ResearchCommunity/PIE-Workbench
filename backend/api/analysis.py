@@ -735,6 +735,12 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
         train_data = disk_cache.load(request.train_cache_key)
         test_data = disk_cache.load(request.test_cache_key)
 
+        # Undo Categorical dtypes from the cache layer — classifiers expect
+        # plain strings for the target and plain numerics for features.
+        for df in (train_data, test_data):
+            for col in df.select_dtypes(include=["category"]).columns:
+                df[col] = df[col].astype(df[col].cat.categories.dtype)
+
         _update_task(task_id, message=f"Train data: {train_data.shape[0]:,} rows x {train_data.shape[1]} columns")
 
         try:
