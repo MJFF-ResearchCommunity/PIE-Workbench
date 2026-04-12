@@ -58,6 +58,9 @@ export const analysisApi = {
   cancelTask: (taskId: string) => api.post(`/analysis/task/${taskId}/cancel`),
   getFeatureImportance: (modelId: string, topN?: number) =>
     api.get(`/analysis/model/${modelId}/feature_importance?top_n=${topN || 20}`),
+  getModelResults: (modelId: string) => api.get(`/analysis/model/${modelId}/results`),
+  getReport: (modelId: string) =>
+    longApi.get(`/analysis/model/${modelId}/report`, { responseType: 'text' }),
   autoML: (request: AutoMLRequest) => longApi.post('/analysis/auto_ml', request),
   calibrate: (request: CalibrateRequest) => api.post('/analysis/calibrate', request),
   validateDrift: (request: DriftValidationRequest) => api.post('/analysis/validate_drift', request),

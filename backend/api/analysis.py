@@ -23,6 +23,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
@@ -1364,3 +1365,94 @@ async def get_feature_importance(model_id: str, top_n: int = 20):
 
     except Exception as e:
         return {"error": str(e)}
+
+
+@router.get("/model/{model_id}/results")
+async def get_model_results(model_id: str):
+    """Get full model results: best model info, metrics, comparison table, confusion matrix."""
+    if model_id not in _models:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    model_info = _models[model_id]
+    classifier = model_info["classifier"]
+    best_model = model_info["model"]
+    comparison_results = model_info.get("comparison_results")
+
+    # --- Best model metrics ---
+    from sklearn.metrics import confusion_matrix as sk_confusion_matrix
+
+    X_test = classifier._X_test
+    y_test = classifier._y_test
+    y_test_enc = classifier._encode_target(y_test)
+    y_pred = best_model.predict(X_test)
+
+    # Compute metrics
+    try:
+        y_proba = best_model.predict_proba(X_test) if hasattr(best_model, 'predict_proba') else None
+    except Exception:
+        y_proba = None
+
+    from pie.classifier import _compute_metrics
+    metrics = _compute_metrics(y_test_enc, y_pred, y_proba)
+
+    # --- Confusion matrix ---
+    labels = sorted(y_test_enc.unique()) if hasattr(y_test_enc, 'unique') else sorted(set(y_test_enc))
+    cm = sk_confusion_matrix(y_test_enc, y_pred, labels=labels)
+
+    # Map encoded labels back to original names if label encoder exists
+    if classifier._label_encoder is not None:
+        label_names = [str(classifier._label_encoder.inverse_transform([l])[0]) for l in labels]
+    else:
+        label_names = [str(l) for l in labels]
+
+    confusion = []
+    for i, actual in enumerate(label_names):
+        for j, predicted in enumerate(label_names):
+            confusion.append({
+                "actual": actual,
+                "predicted": predicted,
+                "value": int(cm[i][j]),
+            })
+
+    # Clean NaN from metrics for JSON
+    clean_metrics = {}
+    for k, v in metrics.items():
+        if isinstance(v, float) and np.isnan(v):
+            clean_metrics[k] = None
+        else:
+            clean_metrics[k] = float(v) if isinstance(v, (float, np.floating)) else v
+
+    return {
+        "best_model_name": type(best_model).__name__,
+        "metrics": clean_metrics,
+        "confusion_matrix": confusion,
+        "class_labels": label_names,
+        "comparison": comparison_results,
+    }
+
+
+@router.get("/model/{model_id}/report", response_class=HTMLResponse)
+async def get_classification_report(model_id: str):
+    """Generate and return the full classification report HTML."""
+    if model_id not in _models:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    model_info = _models[model_id]
+    classifier = model_info["classifier"]
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        classifier.generate_report(output_path=tmp_path)
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        return HTMLResponse(content=html)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {e}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
