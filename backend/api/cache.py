@@ -145,18 +145,22 @@ def store(cache_key: str, data: Any, *, compute_meta: bool = True) -> None:
 
 
 def load(cache_key: str) -> Any:
-    """Load cached data back from disk."""
+    """Load cached data back from disk.
+
+    Categorical columns created by ``downcast_dataframe`` are converted back
+    to their base dtype (same as ``_decat`` does for modular loads).
+    """
     path = _cached_paths.get(cache_key)
     if path is None:
         raise KeyError(f"Cache key not found: {cache_key}")
 
     if path.is_file() and path.suffix == ".parquet":
-        return pd.read_parquet(path, engine="pyarrow")
+        return _decat(pd.read_parquet(path, engine="pyarrow"))
 
     if path.is_dir() and (path / "_is_dict").exists():
         result = {}
         for f in sorted(path.glob("*.parquet")):
-            result[f.stem] = pd.read_parquet(f, engine="pyarrow")
+            result[f.stem] = _decat(pd.read_parquet(f, engine="pyarrow"))
         return result
 
     raise KeyError(f"Cache path invalid for key: {cache_key}")
@@ -169,7 +173,7 @@ def load_sample(cache_key: str, n: int = 100) -> pd.DataFrame:
         raise KeyError(f"Cache key not found or not a DataFrame: {cache_key}")
 
     table = pq.read_table(path).slice(0, n)
-    return table.to_pandas()
+    return _decat(table.to_pandas())
 
 
 def exists(cache_key: str) -> bool:

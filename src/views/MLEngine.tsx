@@ -24,6 +24,7 @@ import {
   Eye,
   Layers,
   Gauge,
+  Square,
 } from 'lucide-react';
 import Card, { CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from '../components/ui/Card';
 import Button from '../components/ui/Button';
@@ -189,6 +190,7 @@ export default function MLEngine() {
   const logEndRef = useRef<HTMLDivElement>(null);
   // Track how many backend log entries we've already shown (ref avoids stale closures in setInterval)
   const lastLogIndexRef = useRef(0);
+  const transitioningRef = useRef(false);
 
   // Auto-scroll log panel to bottom when new entries arrive
   useEffect(() => {
@@ -229,8 +231,7 @@ export default function MLEngine() {
         const response = await analysisApi.getAvailableModels(taskType);
         const models: ModelOption[] = response.data.models;
         setAvailableModels(models);
-        // Default: select all models
-        setSelectedModels(new Set(models.map((m) => m.id)));
+        setSelectedModels(new Set());
       } catch {
         // Fallback: keep whatever we had
       }
@@ -445,6 +446,7 @@ export default function MLEngine() {
 
   const runFeatureSelection = async (cacheKey: string) => {
     setCurrentStep('feature_selection');
+    transitioningRef.current = false;
 
     try {
       const response = await analysisApi.featureSelection({
@@ -467,6 +469,7 @@ export default function MLEngine() {
 
   const runModelTraining = async (trainKey: string, testKey: string) => {
     setCurrentStep('training');
+    transitioningRef.current = false;
 
     try {
       let response;
@@ -498,8 +501,11 @@ export default function MLEngine() {
       setTaskId(response.data.task_id);
       setTaskStatus({ status: 'running', progress: 0, message: mode === 'automl' ? 'Running AutoML...' : 'Training models...' });
       updateTask(response.data.task_id, { status: 'running', progress: 0, message: mode === 'automl' ? 'Running AutoML...' : 'Training models...' });
-    } catch (error) {
-      addToast('Failed to start model training', 'error');
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || error?.message || String(error);
+      addToast(`Failed to start model training: ${detail}`, 'error');
+      addLog(`Training error: ${detail}`, 'error');
+      console.error('Training request failed:', error);
       setLoading(false);
       setCurrentStep('configure');
     }
@@ -535,6 +541,8 @@ export default function MLEngine() {
       updateTask(taskId, { status: status.status, progress: status.progress * 100, message: status.message });
 
       if (status.status === 'completed') {
+        if (transitioningRef.current) return;
+        transitioningRef.current = true;
         removeTask(taskId);
 
         if (currentStep === 'feature_engineering') {
@@ -559,16 +567,39 @@ export default function MLEngine() {
           setCurrentStep('post_training');
         }
       } else if (status.status === 'failed') {
+        transitioningRef.current = false;
         addLog(`Error: ${status.error}`, 'error');
         setLoading(false);
         setCurrentStep('configure');
         removeTask(taskId);
         addToast(`Failed: ${status.error}`, 'error');
+      } else if (status.status === 'cancelled') {
+        transitioningRef.current = false;
+        setLoading(false);
+        setCurrentStep('configure');
+        removeTask(taskId);
       }
     } catch (error) {
       console.error('Failed to poll task status:', error);
     }
   }, [taskId, currentStep, setAnalysis, addLog, addToast, updateTask, removeTask, navigate, runFeatureSelection, runModelTraining]);
+
+  const handleStop = async () => {
+    if (!taskId) return;
+    try {
+      await analysisApi.cancelTask(taskId);
+      addLog('Pipeline stopped by user', 'error');
+      addToast('Pipeline stopped', 'info');
+    } catch {
+      // Even if the cancel request fails, reset the UI
+    }
+    setLoading(false);
+    setCurrentStep('configure');
+    setTaskId(null);
+    setTaskStatus(null);
+    transitioningRef.current = false;
+    removeTask(taskId);
+  };
 
   const handleLeakageScan = async () => {
     if (!data.cacheKey || !targetColumn) return;
@@ -863,6 +894,15 @@ export default function MLEngine() {
               variant="gradient"
               showLabel
             />
+            <div className="mt-6 text-center">
+              <Button
+                variant="danger"
+                onClick={handleStop}
+              >
+                <Square className="w-4 h-4 mr-2 fill-current" />
+                Stop
+              </Button>
+            </div>
           </CardContent>
         </Card>
       )}

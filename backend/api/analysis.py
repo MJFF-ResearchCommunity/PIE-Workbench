@@ -40,6 +40,18 @@ _models: Dict[str, Any] = {}
 _MAX_TASK_LOGS = 2000  # Cap log entries per task
 
 
+class TaskCancelled(Exception):
+    """Raised when a task has been cancelled by the user."""
+    pass
+
+
+def _check_cancelled(task_id: str):
+    """Raise TaskCancelled if the user requested cancellation."""
+    task = _tasks.get(task_id)
+    if task and task.get("cancel_requested"):
+        raise TaskCancelled(f"Task {task_id} cancelled by user")
+
+
 def _update_task(task_id: str, **kwargs):
     """Helper to update task state and append to log history."""
     task = _tasks[task_id]
@@ -491,6 +503,8 @@ async def _feature_engineering_task(task_id: str, request: FeatureEngineeringReq
             },
         )
 
+    except TaskCancelled:
+        logger.info("Task %s cancelled by user", task_id)
     except Exception as e:
         _update_task(task_id, status="failed", error=str(e) or repr(e),
                      message=f"Failed: {e!r}")
@@ -541,6 +555,11 @@ async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest
         df = data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame()
         del data
         gc.collect()
+
+        # Undo Categorical dtypes from the cache/parquet layer
+        for col in df.columns:
+            if isinstance(df[col].dtype, pd.CategoricalDtype):
+                df[col] = df[col].astype(df[col].cat.categories.dtype)
 
         _update_task(task_id, message=f"Loaded {df.shape[0]:,} rows x {df.shape[1]} columns")
 
@@ -698,6 +717,8 @@ async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest
             },
         )
 
+    except TaskCancelled:
+        logger.info("Task %s cancelled by user", task_id)
     except Exception as e:
         _update_task(task_id, status="failed", error=str(e) or repr(e),
                      message=f"Failed: {e!r}")
@@ -727,6 +748,7 @@ async def start_model_training(request: TrainModelRequest, background_tasks: Bac
 async def _train_model_task(task_id: str, request: TrainModelRequest):
     """Background task for model training."""
     try:
+        _check_cancelled(task_id)
         _update_task(task_id, status="running", progress=0.1, message="Loading training data...")
 
         if not disk_cache.exists(request.train_cache_key) or not disk_cache.exists(request.test_cache_key):
@@ -735,12 +757,20 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
         train_data = disk_cache.load(request.train_cache_key)
         test_data = disk_cache.load(request.test_cache_key)
 
-        # Undo Categorical dtypes from the cache layer — classifiers expect
-        # plain strings for the target and plain numerics for features.
+        # Undo ALL Categorical dtypes from the cache/parquet layer.
+        # numpy/sklearn cannot interpret CategoricalDtype as a data type.
         for df in (train_data, test_data):
-            for col in df.select_dtypes(include=["category"]).columns:
-                df[col] = df[col].astype(df[col].cat.categories.dtype)
+            for col in df.columns:
+                if isinstance(df[col].dtype, pd.CategoricalDtype):
+                    df[col] = df[col].astype(df[col].cat.categories.dtype)
 
+        # Extra safety: ensure the target column is plain object, not categorical
+        target = request.target_column
+        for df in (train_data, test_data):
+            if target in df.columns and isinstance(df[target].dtype, pd.CategoricalDtype):
+                df[target] = df[target].astype(str)
+
+        _check_cancelled(task_id)
         _update_task(task_id, message=f"Train data: {train_data.shape[0]:,} rows x {train_data.shape[1]} columns")
 
         try:
@@ -757,6 +787,7 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
                 verbose=False
             )
 
+            _check_cancelled(task_id)
             compare_kwargs = dict(
                 n_select=1,
                 budget_time=request.time_budget_minutes,
@@ -770,14 +801,17 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
 
             best_model = classifier.compare_models(**compare_kwargs)
 
+            _check_cancelled(task_id)
             comparison_results = classifier.comparison_results
             _update_task(task_id, message=f"Best model: {type(best_model).__name__}")
 
             if request.tune_best:
+                _check_cancelled(task_id)
                 _update_task(task_id, progress=0.7, message=f"Tuning {type(best_model).__name__}...")
                 best_model = classifier.tune_model(verbose=False)
                 _update_task(task_id, message="Tuning complete")
 
+            _check_cancelled(task_id)
             _update_task(task_id, progress=0.9, message="Generating predictions on test set...")
 
             predictions = classifier.predict_model(data=test_data, verbose=False)
@@ -806,6 +840,8 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
             _update_task(task_id, status="failed", error="endgame/PIE Classifier not available",
                          message="Failed: endgame/PIE Classifier not available")
 
+    except TaskCancelled:
+        logger.info("Task %s cancelled by user", task_id)
     except Exception as e:
         _update_task(task_id, status="failed", error=str(e) or repr(e), message=f"Failed: {e!r}")
 
@@ -1274,6 +1310,23 @@ async def get_analysis_task_status(task_id: str):
         "error": task.get("error"),
         "logs": task.get("logs", []),
     }
+
+
+@router.post("/task/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """Request cancellation of a running task."""
+    if task_id not in _tasks:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+
+    task = _tasks[task_id]
+    if task.get("status") in ("completed", "failed", "cancelled"):
+        return {"status": task["status"], "message": "Task already finished"}
+
+    task["cancel_requested"] = True
+    task["status"] = "cancelled"
+    task["message"] = "Cancelled by user"
+    logger.info("Task %s: cancellation requested", task_id)
+    return {"status": "cancelled", "message": "Cancellation requested"}
 
 
 @router.get("/model/{model_id}/feature_importance")

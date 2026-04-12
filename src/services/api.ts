@@ -4,7 +4,16 @@ const API_BASE = 'http://127.0.0.1:8100/api';
 
 const api = axios.create({
   baseURL: API_BASE,
-  timeout: 300000, // 5 minutes for long-running tasks
+  timeout: 30000, // 30 seconds for normal requests
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+// No timeout for ML pipeline endpoints — user cancels manually via Stop button
+const longApi = axios.create({
+  baseURL: API_BASE,
+  timeout: 0,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -27,7 +36,7 @@ export const dataApi = {
   detectModalities: (dataPath: string) => api.post(`/data/detect_modalities?data_path=${encodeURIComponent(dataPath)}`),
   preview: (dataPath: string, modality?: string, limit?: number) => 
     api.post(`/data/preview?data_path=${encodeURIComponent(dataPath)}&modality=${modality || ''}&limit=${limit || 50}`),
-  load: (request: DataLoadRequest) => api.post('/data/load', request),
+  load: (request: DataLoadRequest) => longApi.post('/data/load', request),
   getStatus: (taskId: string) => api.get(`/data/status/${taskId}`),
   getColumns: (cacheKey: string) => api.get(`/data/columns?cache_key=${cacheKey}`),
   getMissingnessHeatmap: (cacheKey: string, sampleSize?: number) => 
@@ -41,14 +50,15 @@ export const analysisApi = {
   getAvailableModels: (taskType: string) => api.get(`/analysis/available_models?task_type=${taskType}`),
   suggestTaskType: (cacheKey: string, targetColumn: string) => 
     api.post(`/analysis/suggest_task_type?cache_key=${cacheKey}&target_column=${targetColumn}`),
-  featureEngineering: (request: FeatureEngineeringRequest) => api.post('/analysis/feature_engineering', request),
-  featureSelection: (request: FeatureSelectionRequest) => api.post('/analysis/feature_selection', request),
-  train: (request: TrainModelRequest) => api.post('/analysis/train', request),
-  runPipeline: (request: PipelineRequest) => api.post('/analysis/run_pipeline', request),
+  featureEngineering: (request: FeatureEngineeringRequest) => longApi.post('/analysis/feature_engineering', request),
+  featureSelection: (request: FeatureSelectionRequest) => longApi.post('/analysis/feature_selection', request),
+  train: (request: TrainModelRequest) => longApi.post('/analysis/train', request),
+  runPipeline: (request: PipelineRequest) => longApi.post('/analysis/run_pipeline', request),
   getTaskStatus: (taskId: string) => api.get(`/analysis/task/${taskId}`),
+  cancelTask: (taskId: string) => api.post(`/analysis/task/${taskId}/cancel`),
   getFeatureImportance: (modelId: string, topN?: number) =>
     api.get(`/analysis/model/${modelId}/feature_importance?top_n=${topN || 20}`),
-  autoML: (request: AutoMLRequest) => api.post('/analysis/auto_ml', request),
+  autoML: (request: AutoMLRequest) => longApi.post('/analysis/auto_ml', request),
   calibrate: (request: CalibrateRequest) => api.post('/analysis/calibrate', request),
   validateDrift: (request: DriftValidationRequest) => api.post('/analysis/validate_drift', request),
   detectLeakage: (request: DetectLeakageRequest) => api.post('/analysis/detect_leakage', request),
