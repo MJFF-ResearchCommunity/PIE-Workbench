@@ -42,12 +42,46 @@ class CorrelationRequest(BaseModel):
     method: str = "pearson"  # pearson, spearman, kendall
 
 
+class ScatterRequest(BaseModel):
+    """Request for a paired-variable scatter analysis."""
+    cache_key: str
+    x_variable: str
+    y_variable: str
+    method: str = "pearson"  # pearson, spearman, kendall
+    max_points: int = 2000   # downsample cap for the returned point cloud
+
+
 def _load_for_stats(cache_key: str, columns: List[str]) -> pd.DataFrame:
     """Load only the needed columns, using modular column projection when available."""
     if disk_cache.is_modular(cache_key):
         return disk_cache.load_columns(cache_key, columns)
     # Legacy single-file path
     return disk_cache.load(cache_key)
+
+
+def _to_jsonable(obj):
+    """Recursively coerce numpy scalars to Python natives for FastAPI.
+
+    Specifically: NumPy 2.x dropped ``np.bool_`` as a Python ``bool`` subclass,
+    so FastAPI's ``jsonable_encoder`` blows up with
+    ``TypeError: 'numpy.bool' object is not iterable`` whenever a comparison
+    result like ``p_value < 0.05`` reaches the response. We also coerce
+    numeric numpy scalars and walk dicts/lists/tuples for safety.
+    """
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        v = float(obj)
+        return v if not (np.isnan(v) or np.isinf(v)) else None
+    if isinstance(obj, np.ndarray):
+        return [_to_jsonable(x) for x in obj.tolist()]
+    if isinstance(obj, dict):
+        return {_to_jsonable(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(x) for x in obj]
+    return obj
 
 
 @router.post("/auto_test")
@@ -104,8 +138,8 @@ async def auto_statistical_test(request: StatTestRequest):
                 "description": description,
                 "statistic": float(stat),
                 "p_value": float(p_value),
-                "significant": p_value < 0.05,
-                "group_statistics": group_stats,
+                "significant": bool(p_value < 0.05),
+                "group_statistics": _to_jsonable(group_stats),
                 "interpretation": _interpret_p_value(p_value, test_name)
             }
 
@@ -123,7 +157,7 @@ async def auto_statistical_test(request: StatTestRequest):
                 "description": description,
                 "correlation": float(stat),
                 "p_value": float(p_value),
-                "significant": p_value < 0.05,
+                "significant": bool(p_value < 0.05),
                 "interpretation": _interpret_correlation(stat, p_value)
             }
 
@@ -141,8 +175,8 @@ async def auto_statistical_test(request: StatTestRequest):
                 "chi2_statistic": float(chi2),
                 "p_value": float(p_value),
                 "degrees_of_freedom": int(dof),
-                "significant": p_value < 0.05,
-                "contingency_table": contingency.to_dict(),
+                "significant": bool(p_value < 0.05),
+                "contingency_table": _to_jsonable(contingency.to_dict()),
                 "interpretation": _interpret_p_value(p_value, test_name)
             }
 
@@ -179,7 +213,7 @@ async def run_ttest(cache_key: str, variable: str, grouping_variable: str):
             "test_name": "Independent T-Test",
             "statistic": float(stat),
             "p_value": float(p_value),
-            "significant": p_value < 0.05
+            "significant": bool(p_value < 0.05),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -205,9 +239,103 @@ async def run_anova(cache_key: str, variable: str, grouping_variable: str):
             "test_name": "One-Way ANOVA",
             "f_statistic": float(stat),
             "p_value": float(p_value),
-            "significant": p_value < 0.05,
-            "n_groups": len(groups)
+            "significant": bool(p_value < 0.05),
+            "n_groups": len(groups),
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/scatter")
+async def run_scatter_correlation(request: ScatterRequest):
+    """
+    Compute correlation between two numeric variables AND return the (x, y)
+    points + best-fit line so the frontend can plot a scatter with regression
+    overlay. Points are downsampled to ``max_points`` to keep payloads light.
+    """
+    if not disk_cache.exists(request.cache_key) and not disk_cache.is_modular(request.cache_key):
+        raise HTTPException(status_code=404, detail=f"Data not found: {request.cache_key}")
+
+    data = _load_for_stats(request.cache_key, [request.x_variable, request.y_variable])
+    if not isinstance(data, pd.DataFrame):
+        raise HTTPException(status_code=400, detail="Cached data is not a DataFrame")
+
+    if request.x_variable not in data.columns:
+        raise HTTPException(status_code=400, detail=f"X variable not found: {request.x_variable}")
+    if request.y_variable not in data.columns:
+        raise HTTPException(status_code=400, detail=f"Y variable not found: {request.y_variable}")
+
+    aligned = data[[request.x_variable, request.y_variable]].apply(pd.to_numeric, errors="coerce").dropna()
+    n = int(len(aligned))
+    if n < 3:
+        raise HTTPException(status_code=400, detail=f"Need at least 3 paired observations, got {n}")
+
+    try:
+        from scipy import stats
+
+        x = aligned[request.x_variable].to_numpy(dtype=float)
+        y = aligned[request.y_variable].to_numpy(dtype=float)
+
+        if request.method == "pearson":
+            r, p_value = stats.pearsonr(x, y)
+            method_name = "Pearson"
+        elif request.method == "spearman":
+            r, p_value = stats.spearmanr(x, y)
+            method_name = "Spearman"
+        elif request.method == "kendall":
+            r, p_value = stats.kendalltau(x, y)
+            method_name = "Kendall"
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown method: {request.method}")
+
+        # OLS regression line (always Pearson-style fit, regardless of method)
+        slope_obj = stats.linregress(x, y)
+        slope = float(slope_obj.slope)
+        intercept = float(slope_obj.intercept)
+        r_squared = float(slope_obj.rvalue ** 2)
+
+        # Downsample point cloud for the chart
+        max_points = max(50, min(int(request.max_points), 10_000))
+        if n > max_points:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(n, size=max_points, replace=False)
+            x_sample = x[idx]
+            y_sample = y[idx]
+        else:
+            x_sample = x
+            y_sample = y
+
+        # Endpoints for the regression line on the downsampled domain
+        x_min, x_max = float(x.min()), float(x.max())
+        line_endpoints = [
+            {"x": x_min, "y": intercept + slope * x_min},
+            {"x": x_max, "y": intercept + slope * x_max},
+        ]
+
+        return _to_jsonable({
+            "test_name": f"{method_name} Correlation",
+            "method": request.method,
+            "x_variable": request.x_variable,
+            "y_variable": request.y_variable,
+            "n": n,
+            "n_plotted": int(len(x_sample)),
+            "correlation": float(r),
+            "p_value": float(p_value),
+            "significant": bool(p_value < 0.05),
+            "regression": {
+                "slope": slope,
+                "intercept": intercept,
+                "r_squared": r_squared,
+                "endpoints": line_endpoints,
+            },
+            "points": [{"x": float(xv), "y": float(yv)} for xv, yv in zip(x_sample, y_sample)],
+            "interpretation": _interpret_correlation(float(r), float(p_value)),
+        })
+
+    except HTTPException:
+        raise
+    except ImportError:
+        raise HTTPException(status_code=500, detail="scipy not available")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -279,14 +407,22 @@ async def run_survival_analysis(request: SurvivalAnalysisRequest):
 
             for group_val in unique_groups:
                 mask = groups == group_val
+                T_g = T[mask]
+                E_g = E[mask]
                 kmf = KaplanMeierFitter()
-                kmf.fit(T[mask], E[mask], label=str(group_val))
+                kmf.fit(T_g, E_g, label=str(group_val))
 
+                n_subjects = int(mask.sum())
+                n_events = int(E_g.fillna(0).astype(bool).sum())
                 results["curves"].append({
                     "group": str(group_val),
                     "timeline": kmf.survival_function_.index.tolist(),
                     "survival": kmf.survival_function_.iloc[:, 0].tolist(),
-                    "median_survival": float(kmf.median_survival_time_) if not np.isinf(kmf.median_survival_time_) else None
+                    "median_survival": float(kmf.median_survival_time_) if not np.isinf(kmf.median_survival_time_) else None,
+                    "n_subjects": n_subjects,
+                    "n_events": n_events,
+                    "n_censored": n_subjects - n_events,
+                    "follow_up_max": float(T_g.max()) if len(T_g) else None,
                 })
 
             # Log-rank test
@@ -297,21 +433,27 @@ async def run_survival_analysis(request: SurvivalAnalysisRequest):
                 results["statistics"]["logrank"] = {
                     "test_statistic": float(lr_result.test_statistic),
                     "p_value": float(lr_result.p_value),
-                    "significant": lr_result.p_value < 0.05
+                    "significant": bool(lr_result.p_value < 0.05),
                 }
         else:
             # Overall survival
             kmf = KaplanMeierFitter()
             kmf.fit(T, E, label="Overall")
 
+            n_subjects = int(len(T))
+            n_events = int(E.fillna(0).astype(bool).sum())
             results["curves"].append({
                 "group": "Overall",
                 "timeline": kmf.survival_function_.index.tolist(),
                 "survival": kmf.survival_function_.iloc[:, 0].tolist(),
-                "median_survival": float(kmf.median_survival_time_) if not np.isinf(kmf.median_survival_time_) else None
+                "median_survival": float(kmf.median_survival_time_) if not np.isinf(kmf.median_survival_time_) else None,
+                "n_subjects": n_subjects,
+                "n_events": n_events,
+                "n_censored": n_subjects - n_events,
+                "follow_up_max": float(T.max()) if len(T) else None,
             })
 
-        return results
+        return _to_jsonable(results)
 
     except ImportError:
         raise HTTPException(status_code=500, detail="lifelines library not available")
@@ -355,12 +497,12 @@ async def get_descriptive_statistics(cache_key: str, variables: List[str]):
                 "type": "categorical",
                 "count": int(col.count()),
                 "unique": int(col.nunique()),
-                "top_values": value_counts,
+                "top_values": _to_jsonable(value_counts),
                 "missing": int(col.isnull().sum()),
                 "missing_pct": round(col.isnull().sum() / len(col) * 100, 2) if len(col) > 0 else 0
             }
 
-    return {"statistics": results}
+    return {"statistics": _to_jsonable(results)}
 
 
 def _interpret_p_value(p_value: float, test_name: str) -> str:

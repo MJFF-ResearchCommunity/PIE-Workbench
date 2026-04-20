@@ -39,6 +39,41 @@ _tasks: Dict[str, Dict[str, Any]] = {}
 _models: Dict[str, Any] = {}
 
 _MAX_TASK_LOGS = 2000  # Cap log entries per task
+# Bound the number of trained classifiers we keep resident. Each entry pins
+# the classifier's training data, comparison results, and best-model object;
+# letting the dict grow unboundedly across runs is the single largest source
+# of slow RAM creep observed in the workbench.
+_MAX_RETAINED_MODELS = 3
+
+
+def _free_classifier(model_entry: Dict[str, Any]) -> None:
+    """Release the heavy state hanging off a stored classifier so the next
+    training run starts from a clean baseline."""
+    classifier = model_entry.get("classifier")
+    if classifier is None:
+        return
+    for attr in ("_X_train", "_X_test", "_y_train", "_y_test"):
+        try:
+            setattr(classifier, attr, None)
+        except Exception:
+            pass
+    try:
+        classifier.models_dict = {}
+    except Exception:
+        pass
+    try:
+        classifier.setup_params = None
+    except Exception:
+        pass
+
+
+def _evict_old_models(keep: int = _MAX_RETAINED_MODELS) -> None:
+    """Drop the oldest stored classifiers to keep RAM bounded across runs."""
+    while len(_models) >= keep:
+        oldest_id = next(iter(_models))
+        _free_classifier(_models[oldest_id])
+        _models.pop(oldest_id, None)
+        gc.collect()
 
 
 class TaskCancelled(Exception):
@@ -451,6 +486,10 @@ async def _feature_engineering_task(task_id: str, request: FeatureEngineeringReq
             _update_task(task_id, progress=0.55, message="Applying FeatureEngineer...")
 
             engineer = FeatureEngineer(merged_df)
+            # FeatureEngineer takes its own .copy() in __init__; release ours
+            # so the post-OHE working set isn't double-resident.
+            del merged_df
+            gc.collect()
 
             if request.one_hot_encode:
                 _update_task(task_id, message="One-hot encoding categorical features...")
@@ -468,10 +507,15 @@ async def _feature_engineering_task(task_id: str, request: FeatureEngineeringReq
 
             engineered_df = engineer.get_dataframe()
             summary = engineer.get_engineered_feature_summary()
+            # get_dataframe() returns yet another .copy(); drop the engineer's
+            # internal frame so we're not pinning the same data twice.
+            del engineer
+            gc.collect()
 
         except ImportError:
             _update_task(task_id, message="PIE FeatureEngineer not available — basic OHE fallback...")
             engineered_df = merged_df
+            del merged_df  # we now reach the engineered frame via engineered_df
             cat_cols = engineered_df.select_dtypes(include=["object", "category"]).columns
             for col in cat_cols:
                 if col == target:
@@ -489,7 +533,9 @@ async def _feature_engineering_task(task_id: str, request: FeatureEngineeringReq
         _update_task(task_id, progress=0.90,
                      message=f"Caching engineered data ({new_shape[0]:,} rows x {new_shape[1]} cols)...")
         disk_cache.store(new_cache_key, engineered_df)
-        del engineered_df, merged_df
+        del engineered_df
+        # merged_df was already released after FeatureEngineer init (or never
+        # created in the ImportError fallback path).
         gc.collect()
 
         _update_task(
@@ -545,24 +591,34 @@ async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest
       - fillna(0)
       - train/test split (stratified)
       - FeatureSelector fit/transform
+
+    Each CPU-bound step is dispatched through ``loop.run_in_executor`` so the
+    asyncio loop stays responsive — otherwise the status-poll endpoint serves
+    stale data and the UI looks "stuck" even when work is progressing.
     """
+    loop = asyncio.get_event_loop()
     try:
         from sklearn.model_selection import train_test_split
         from sklearn.preprocessing import LabelEncoder
 
-        _update_task(task_id, status="running", progress=0.1, message="Loading engineered data...")
+        _update_task(task_id, status="running", progress=0.1, message="Loading engineered data from cache...")
 
-        data = disk_cache.load(request.cache_key)
+        data = await loop.run_in_executor(None, disk_cache.load, request.cache_key)
         df = data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame()
         del data
         gc.collect()
 
         # Undo Categorical dtypes from the cache/parquet layer
-        for col in df.columns:
-            if isinstance(df[col].dtype, pd.CategoricalDtype):
-                df[col] = df[col].astype(df[col].cat.categories.dtype)
+        def _strip_categoricals(frame: pd.DataFrame) -> pd.DataFrame:
+            for col in frame.columns:
+                if isinstance(frame[col].dtype, pd.CategoricalDtype):
+                    frame[col] = frame[col].astype(frame[col].cat.categories.dtype)
+            return frame
 
-        _update_task(task_id, message=f"Loaded {df.shape[0]:,} rows x {df.shape[1]} columns")
+        df = await loop.run_in_executor(None, _strip_categoricals, df)
+
+        _update_task(task_id, progress=0.15,
+                     message=f"Loaded {df.shape[0]:,} rows x {df.shape[1]} columns")
 
         # Remove leakage features (never drop the target column)
         if request.leakage_features:
@@ -599,30 +655,38 @@ async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest
         y = df[request.target_column]
 
         # ----- Resolve remaining pipe-separated values (PIE pipeline.py L270-319) -----
+        # Off-thread: this can be many million Python-level apply() calls on
+        # PPMI's pipe-encoded medical-history fields and otherwise blocks the
+        # event loop for tens of seconds.
         _ID_DATE_PATS = ["ID", "DATE", "TIME", "PATNO", "EVENT"]
-        pipe_resolved = 0
-        for col in X.select_dtypes(include=["object"]).columns:
-            if any(p in col.upper() for p in _ID_DATE_PATS):
-                continue
-            if not X[col].astype(str).str.contains(r"\|", na=False).any():
-                continue
 
-            def _avg_pipe(val):
-                if isinstance(val, str) and "|" in val:
-                    try:
-                        return np.mean([float(x) for x in val.split("|")])
-                    except (ValueError, TypeError):
-                        return np.nan
-                return val
+        def _resolve_pipes(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+            resolved = 0
+            for col in frame.select_dtypes(include=["object"]).columns:
+                if any(p in col.upper() for p in _ID_DATE_PATS):
+                    continue
+                if not frame[col].astype(str).str.contains(r"\|", na=False).any():
+                    continue
 
-            converted = X[col].apply(_avg_pipe)
-            numeric = pd.to_numeric(converted, errors="coerce")
-            n_nonnull = X[col].notna().sum()
-            n_numeric = numeric.notna().sum()
-            if n_nonnull > 0 and (n_numeric / n_nonnull) > 0.9:
-                X[col] = numeric
-                pipe_resolved += 1
+                def _avg_pipe(val):
+                    if isinstance(val, str) and "|" in val:
+                        try:
+                            return np.mean([float(x) for x in val.split("|")])
+                        except (ValueError, TypeError):
+                            return np.nan
+                    return val
 
+                converted = frame[col].apply(_avg_pipe)
+                numeric = pd.to_numeric(converted, errors="coerce")
+                n_nonnull = frame[col].notna().sum()
+                n_numeric = numeric.notna().sum()
+                if n_nonnull > 0 and (n_numeric / n_nonnull) > 0.9:
+                    frame[col] = numeric
+                    resolved += 1
+            return frame, resolved
+
+        _update_task(task_id, progress=0.25, message="Resolving pipe-separated columns...")
+        X, pipe_resolved = await loop.run_in_executor(None, _resolve_pipes, X)
         if pipe_resolved:
             _update_task(task_id, message=f"Resolved pipe-separated values in {pipe_resolved} columns")
 
@@ -632,21 +696,26 @@ async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest
             _update_task(task_id, message=f"Dropping {len(non_numeric)} non-numeric columns")
             X = X.drop(columns=non_numeric)
 
-        X = X.fillna(0)
+        _update_task(task_id, progress=0.30, message="Filling missing values...")
+        X = await loop.run_in_executor(None, lambda: X.fillna(0))
 
         _update_task(task_id, progress=0.35,
                      message=f"Numeric features: {X.shape[1]}, target classes: {y.nunique()}")
 
+        _update_task(task_id, progress=0.40, message="Encoding target labels...")
         le = LabelEncoder()
-        y_encoded = le.fit_transform(y)
+        y_encoded = await loop.run_in_executor(None, le.fit_transform, y)
 
-        _update_task(task_id, progress=0.4, message="Splitting train/test...")
+        _update_task(task_id, progress=0.45, message="Splitting train/test (stratified)...")
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=request.test_size, random_state=42, stratify=y_encoded
-        )
+        def _split():
+            return train_test_split(
+                X, y, test_size=request.test_size, random_state=42, stratify=y_encoded,
+            )
 
-        _update_task(task_id, message=f"Train: {X_train.shape[0]:,} rows, Test: {X_test.shape[0]:,} rows")
+        X_train, X_test, y_train, y_test = await loop.run_in_executor(None, _split)
+        _update_task(task_id, progress=0.50,
+                     message=f"Train: {X_train.shape[0]:,} rows, Test: {X_test.shape[0]:,} rows")
 
         if request.method == "none":
             _update_task(task_id, message="Skipping feature selection — keeping all features")
@@ -658,7 +727,7 @@ async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest
                 from pie.feature_selector import FeatureSelector
 
                 _update_task(task_id, progress=0.55,
-                             message=f"Applying {request.method} feature selection...")
+                             message=f"Applying {request.method} feature selection on {X_train.shape[0]:,} rows × {X_train.shape[1]} features...")
 
                 selector = FeatureSelector(
                     method=request.method,
@@ -667,36 +736,58 @@ async def _feature_selection_task(task_id: str, request: FeatureSelectionRequest
                     alpha_fdr=request.param_value if request.method == "fdr" else 0.05,
                 )
 
-                y_train_enc = le.fit_transform(y_train)
-                selector.fit(X_train, y_train_enc)
-                X_train_selected = selector.transform(X_train)
-                X_test_selected = selector.transform(X_test)
-                selected_features = selector.selected_feature_names_
+                y_train_enc = await loop.run_in_executor(None, le.fit_transform, y_train)
+
+                _update_task(task_id, progress=0.60,
+                             message="Scoring features (this is the longest step)...")
+
+                def _fit_and_transform():
+                    selector.fit(X_train, y_train_enc)
+                    return (
+                        selector.transform(X_train),
+                        selector.transform(X_test),
+                        selector.selected_feature_names_,
+                    )
+
+                X_train_selected, X_test_selected, selected_features = await loop.run_in_executor(
+                    None, _fit_and_transform
+                )
 
             except ImportError:
                 from sklearn.feature_selection import VarianceThreshold
                 _update_task(task_id, message="PIE FeatureSelector not available, using VarianceThreshold fallback...")
 
-                vt = VarianceThreshold(threshold=0.01)
-                X_train_selected = pd.DataFrame(
-                    vt.fit_transform(X_train), columns=X_train.columns[vt.get_support()]
-                )
-                X_test_selected = pd.DataFrame(
-                    vt.transform(X_test), columns=X_train.columns[vt.get_support()]
-                )
-                selected_features = list(X_train_selected.columns)
+                def _vt_fit():
+                    vt = VarianceThreshold(threshold=0.01)
+                    Xtr = pd.DataFrame(
+                        vt.fit_transform(X_train), columns=X_train.columns[vt.get_support()]
+                    )
+                    Xte = pd.DataFrame(
+                        vt.transform(X_test), columns=X_train.columns[vt.get_support()]
+                    )
+                    return Xtr, Xte, list(Xtr.columns)
 
-        _update_task(task_id, progress=0.8,
+                X_train_selected, X_test_selected, selected_features = await loop.run_in_executor(
+                    None, _vt_fit
+                )
+
+        _update_task(task_id, progress=0.85,
                      message=f"Selected {len(selected_features)} features from {X.shape[1]}")
 
-        train_df = pd.concat([X_train_selected.reset_index(drop=True), y_train.reset_index(drop=True)], axis=1)
-        test_df = pd.concat([X_test_selected.reset_index(drop=True), y_test.reset_index(drop=True)], axis=1)
+        def _build_split_frames():
+            train = pd.concat([X_train_selected.reset_index(drop=True),
+                               y_train.reset_index(drop=True)], axis=1)
+            test = pd.concat([X_test_selected.reset_index(drop=True),
+                              y_test.reset_index(drop=True)], axis=1)
+            return train, test
+
+        train_df, test_df = await loop.run_in_executor(None, _build_split_frames)
 
         train_cache_key = f"train_{task_id}"
         test_cache_key = f"test_{task_id}"
-        _update_task(task_id, message="Caching train/test splits to disk...")
-        disk_cache.store(train_cache_key, train_df)
-        disk_cache.store(test_cache_key, test_df)
+        _update_task(task_id, progress=0.92, message="Caching train/test splits to disk...")
+        await loop.run_in_executor(None, disk_cache.store, train_cache_key, train_df)
+        await loop.run_in_executor(None, disk_cache.store, test_cache_key, test_df)
 
         train_shape = list(train_df.shape)
         test_shape = list(test_df.shape)
@@ -747,7 +838,13 @@ async def start_model_training(request: TrainModelRequest, background_tasks: Bac
 
 
 async def _train_model_task(task_id: str, request: TrainModelRequest):
-    """Background task for model training."""
+    """Background task for model training.
+
+    Heavy CPU work (cache load, ``compare_models``, tuning, prediction) is
+    dispatched through ``loop.run_in_executor`` so the asyncio loop can keep
+    serving status polls — otherwise the UI looks "stuck" mid-training.
+    """
+    loop = asyncio.get_event_loop()
     try:
         _check_cancelled(task_id)
         _update_task(task_id, status="running", progress=0.1, message="Loading training data...")
@@ -755,21 +852,30 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
         if not disk_cache.exists(request.train_cache_key) or not disk_cache.exists(request.test_cache_key):
             raise ValueError("Training or test data not found in cache")
 
-        train_data = disk_cache.load(request.train_cache_key)
-        test_data = disk_cache.load(request.test_cache_key)
+        # Free retained classifiers from prior runs *before* loading new data.
+        # Each retained entry can hold gigabytes (training matrix + compared
+        # models), so this is the largest single RAM win between runs.
+        _evict_old_models()
+
+        train_data = await loop.run_in_executor(None, disk_cache.load, request.train_cache_key)
+        test_data = await loop.run_in_executor(None, disk_cache.load, request.test_cache_key)
 
         # Undo ALL Categorical dtypes from the cache/parquet layer.
         # numpy/sklearn cannot interpret CategoricalDtype as a data type.
-        for df in (train_data, test_data):
-            for col in df.columns:
-                if isinstance(df[col].dtype, pd.CategoricalDtype):
-                    df[col] = df[col].astype(df[col].cat.categories.dtype)
-
-        # Extra safety: ensure the target column is plain object, not categorical
         target = request.target_column
-        for df in (train_data, test_data):
-            if target in df.columns and isinstance(df[target].dtype, pd.CategoricalDtype):
-                df[target] = df[target].astype(str)
+
+        def _normalize_dtypes(frames):
+            for frame in frames:
+                for col in frame.columns:
+                    if isinstance(frame[col].dtype, pd.CategoricalDtype):
+                        frame[col] = frame[col].astype(frame[col].cat.categories.dtype)
+                if target in frame.columns and isinstance(frame[target].dtype, pd.CategoricalDtype):
+                    frame[target] = frame[target].astype(str)
+            return frames
+
+        train_data, test_data = await loop.run_in_executor(
+            None, _normalize_dtypes, (train_data, test_data)
+        )
 
         _check_cancelled(task_id)
         _update_task(task_id, message=f"Train data: {train_data.shape[0]:,} rows x {train_data.shape[1]} columns")
@@ -780,13 +886,23 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
             _update_task(task_id, progress=0.2, message="Setting up classifier...")
 
             classifier = Classifier()
-            classifier.setup_experiment(
-                data=train_data,
-                target=request.target_column,
-                test_data=test_data,
-                session_id=42,
-                verbose=False
-            )
+
+            def _setup():
+                classifier.setup_experiment(
+                    data=train_data,
+                    target=request.target_column,
+                    test_data=test_data,
+                    session_id=42,
+                    verbose=False,
+                )
+
+            await loop.run_in_executor(None, _setup)
+
+            # Classifier has now copied what it needs (_X_train / _X_test).
+            # Drop our local refs so the loaded frames can be reclaimed before
+            # CV begins — otherwise we hold the data twice for the entire run.
+            del train_data, test_data
+            gc.collect()
 
             _check_cancelled(task_id)
             compare_kwargs = dict(
@@ -796,28 +912,42 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
             )
             if request.models_to_compare:
                 compare_kwargs["include"] = request.models_to_compare
-                _update_task(task_id, progress=0.4, message=f"Comparing {len(request.models_to_compare)} selected models...")
+                _update_task(task_id, progress=0.4,
+                             message=f"Comparing {len(request.models_to_compare)} selected models (CV)...")
             else:
                 _update_task(task_id, progress=0.4, message="Comparing models (auto-pilot)...")
 
-            best_model = classifier.compare_models(**compare_kwargs)
+            best_model = await loop.run_in_executor(
+                None, lambda: classifier.compare_models(**compare_kwargs)
+            )
 
             _check_cancelled(task_id)
             comparison_results = classifier.comparison_results
-            _update_task(task_id, message=f"Best model: {type(best_model).__name__}")
+            _update_task(task_id, progress=0.65,
+                         message=f"Best model: {type(best_model).__name__}")
 
             if request.tune_best:
                 _check_cancelled(task_id)
                 _update_task(task_id, progress=0.7, message=f"Tuning {type(best_model).__name__}...")
-                best_model = classifier.tune_model(verbose=False)
+                best_model = await loop.run_in_executor(
+                    None, lambda: classifier.tune_model(verbose=False)
+                )
                 _update_task(task_id, message="Tuning complete")
 
             _check_cancelled(task_id)
             _update_task(task_id, progress=0.9, message="Generating predictions on test set...")
 
-            predictions = classifier.predict_model(data=test_data, verbose=False)
+            # Use the classifier's stored _X_test (already a copy made during
+            # setup_experiment) rather than re-passing test_data — that local
+            # has been freed to keep RAM bounded during CV.
+            predictions = await loop.run_in_executor(
+                None, lambda: classifier.predict_model(verbose=False)
+            )
+            predictions_shape = list(predictions.shape)
+            del predictions  # large per-row score frame, no longer needed
 
-            # Store the model
+            # Store the model. comparison_results is converted to a plain dict
+            # so we don't keep a live pandas object around just for inspection.
             model_id = f"model_{task_id}"
             _models[model_id] = {
                 "classifier": classifier,
@@ -833,7 +963,7 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
                     "model_id": model_id,
                     "model_name": type(best_model).__name__,
                     "comparison_results": comparison_results.head(10).to_dict() if comparison_results is not None else None,
-                    "test_predictions_shape": list(predictions.shape),
+                    "test_predictions_shape": predictions_shape,
                 },
             )
 
@@ -871,6 +1001,10 @@ async def _auto_ml_task(task_id: str, request: AutoMLRequest):
         if not disk_cache.exists(request.train_cache_key) or not disk_cache.exists(request.test_cache_key):
             raise ValueError("Training or test data not found in cache")
 
+        # Same eviction discipline as _train_model_task: prior runs can hold
+        # gigabytes of training state. Free them before loading new frames.
+        _evict_old_models()
+
         train_data = disk_cache.load(request.train_cache_key)
         test_data = disk_cache.load(request.test_cache_key)
 
@@ -884,6 +1018,8 @@ async def _auto_ml_task(task_id: str, request: AutoMLRequest):
             session_id=42,
             verbose=False,
         )
+        del train_data, test_data
+        gc.collect()
 
         _update_task(task_id, progress=0.2, message="Running AutoML pipeline...")
 

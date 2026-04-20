@@ -191,6 +191,15 @@ export default function MLEngine() {
   // Track how many backend log entries we've already shown (ref avoids stale closures in setInterval)
   const lastLogIndexRef = useRef(0);
   const transitioningRef = useRef(false);
+  // Tracks the last task ID we've taken a terminal action on (completed /
+  // failed / cancelled). Stale interval polls and in-flight requests for an
+  // already-handled task short-circuit instead of re-running side effects.
+  const handledTaskRef = useRef<string | null>(null);
+  // Indirection so the polling interval always invokes the freshest
+  // pollTaskStatus closure (current taskId / currentStep) without resetting
+  // its 2 s cadence on every render. Populated by an effect after
+  // pollTaskStatus is declared further down.
+  const pollTaskStatusRef = useRef<(() => Promise<void>) | null>(null);
 
   // Auto-scroll log panel to bottom when new entries arrive
   useEffect(() => {
@@ -219,7 +228,9 @@ export default function MLEngine() {
   useEffect(() => {
     let interval: NodeJS.Timeout;
     if (taskId && taskStatus?.status === 'running') {
-      interval = setInterval(pollTaskStatus, 2000);
+      interval = setInterval(() => {
+        pollTaskStatusRef.current?.();
+      }, 2000);
     }
     return () => clearInterval(interval);
   }, [taskId, taskStatus?.status]);
@@ -421,6 +432,8 @@ export default function MLEngine() {
     setCurrentStep('feature_engineering');
     setLogs([]);
     lastLogIndexRef.current = 0;
+    handledTaskRef.current = null;
+    transitioningRef.current = false;
     addLog('Starting ML analysis pipeline...', 'info');
     addLog(`Target: ${targetColumn}, Method: ${fsMethod}, Leakage exclusions: ${leakageFeatures.size}`, 'info');
 
@@ -446,7 +459,11 @@ export default function MLEngine() {
 
   const runFeatureSelection = async (cacheKey: string) => {
     setCurrentStep('feature_selection');
-    transitioningRef.current = false;
+    // NOTE: transitioningRef stays true here on purpose. Resetting it before
+    // the new task ID has propagated lets stale polls of the just-completed
+    // FE task re-trigger this transition (observed: "Starting feature
+    // selection..." logged 5x in a single tick). pollTaskStatus resets the
+    // ref once it sees the new task in the 'running' state.
 
     try {
       const response = await analysisApi.featureSelection({
@@ -461,6 +478,7 @@ export default function MLEngine() {
       setTaskStatus({ status: 'running', progress: 0, message: 'Selecting features...' });
       updateTask(response.data.task_id, { status: 'running', progress: 0, message: 'Selecting features...' });
     } catch (error) {
+      transitioningRef.current = false;
       addToast('Failed to start feature selection', 'error');
       setLoading(false);
       setCurrentStep('configure');
@@ -469,7 +487,8 @@ export default function MLEngine() {
 
   const runModelTraining = async (trainKey: string, testKey: string) => {
     setCurrentStep('training');
-    transitioningRef.current = false;
+    // transitioningRef stays true until pollTaskStatus sees the new task
+    // running — see runFeatureSelection for the full rationale.
 
     try {
       let response;
@@ -502,6 +521,7 @@ export default function MLEngine() {
       setTaskStatus({ status: 'running', progress: 0, message: mode === 'automl' ? 'Running AutoML...' : 'Training models...' });
       updateTask(response.data.task_id, { status: 'running', progress: 0, message: mode === 'automl' ? 'Running AutoML...' : 'Training models...' });
     } catch (error: any) {
+      transitioningRef.current = false;
       const detail = error?.response?.data?.detail || error?.message || String(error);
       addToast(`Failed to start model training: ${detail}`, 'error');
       addLog(`Training error: ${detail}`, 'error');
@@ -513,10 +533,22 @@ export default function MLEngine() {
 
   const pollTaskStatus = useCallback(async () => {
     if (!taskId) return;
+    const polledTaskId = taskId;
 
     try {
-      const response = await analysisApi.getTaskStatus(taskId);
+      const response = await analysisApi.getTaskStatus(polledTaskId);
       const status = response.data;
+
+      // If taskId rotated while this request was in flight, OR we've already
+      // acted on this task's terminal state, drop the result on the floor.
+      if (polledTaskId !== taskId) return;
+      if (
+        handledTaskRef.current === polledTaskId &&
+        status.status !== 'running' &&
+        status.status !== 'pending'
+      ) {
+        return;
+      }
 
       // Ingest any new log entries from the backend
       const backendLogs: { timestamp: string; message: string }[] = status.logs || [];
@@ -538,12 +570,21 @@ export default function MLEngine() {
       }
 
       setTaskStatus(status);
-      updateTask(taskId, { status: status.status, progress: status.progress * 100, message: status.message });
+      updateTask(polledTaskId, { status: status.status, progress: status.progress * 100, message: status.message });
+
+      // Once we're successfully polling a fresh task, re-arm the transition
+      // gate. This is intentionally NOT done in runFeatureSelection /
+      // runModelTraining — doing it there created a window where stale polls
+      // of the just-completed predecessor could re-fire the transition.
+      if (status.status === 'running') {
+        transitioningRef.current = false;
+      }
 
       if (status.status === 'completed') {
         if (transitioningRef.current) return;
         transitioningRef.current = true;
-        removeTask(taskId);
+        handledTaskRef.current = polledTaskId;
+        removeTask(polledTaskId);
 
         if (currentStep === 'feature_engineering') {
           setAnalysis({ engineeredCacheKey: status.result.cache_key });
@@ -567,22 +608,33 @@ export default function MLEngine() {
           setCurrentStep('post_training');
         }
       } else if (status.status === 'failed') {
+        if (handledTaskRef.current === polledTaskId) return;
+        handledTaskRef.current = polledTaskId;
         transitioningRef.current = false;
         addLog(`Error: ${status.error}`, 'error');
         setLoading(false);
         setCurrentStep('configure');
-        removeTask(taskId);
+        removeTask(polledTaskId);
         addToast(`Failed: ${status.error}`, 'error');
       } else if (status.status === 'cancelled') {
+        if (handledTaskRef.current === polledTaskId) return;
+        handledTaskRef.current = polledTaskId;
         transitioningRef.current = false;
         setLoading(false);
         setCurrentStep('configure');
-        removeTask(taskId);
+        removeTask(polledTaskId);
       }
     } catch (error) {
       console.error('Failed to poll task status:', error);
     }
   }, [taskId, currentStep, setAnalysis, addLog, addToast, updateTask, removeTask, navigate, runFeatureSelection, runModelTraining]);
+
+  // Keep the ref consumed by the polling interval pointed at the freshest
+  // pollTaskStatus closure. Defined here (not at the interval site) because
+  // pollTaskStatus is declared further down.
+  useEffect(() => {
+    pollTaskStatusRef.current = pollTaskStatus;
+  }, [pollTaskStatus]);
 
   const handleStop = async () => {
     if (!taskId) return;

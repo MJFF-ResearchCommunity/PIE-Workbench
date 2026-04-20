@@ -24,6 +24,8 @@ declare global {
     electronAPI?: {
       selectDirectory: () => Promise<string | null>;
       selectFile: (options?: { filters?: Array<{ name: string; extensions: string[] }> }) => Promise<string | null>;
+      saveFile?: (options?: { filters?: Array<{ name: string; extensions: string[] }> }) => Promise<string | null>;
+      openReportHtml?: (html: string) => Promise<{ ok: boolean; path?: string; error?: string }>;
     };
   }
 }

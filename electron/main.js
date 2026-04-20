@@ -1,5 +1,7 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const { spawn } = require('child_process');
 
 let mainWindow;
@@ -109,6 +111,25 @@ ipcMain.handle('select-file', async (event, options) => {
   } catch (error) {
     console.error('Error showing file dialog:', error);
     return null;
+  }
+});
+
+// Write report HTML to a temp file and open it in the user's default browser.
+// Used by the Results view's "View Full Report" button so the report renders
+// in a real browser window instead of an in-app modal iframe.
+ipcMain.handle('open-report-html', async (event, html) => {
+  try {
+    if (typeof html !== 'string' || !html) {
+      return { ok: false, error: 'No report content to open' };
+    }
+    const filename = `pie-report-${Date.now()}.html`;
+    const filePath = path.join(os.tmpdir(), filename);
+    fs.writeFileSync(filePath, html, 'utf8');
+    await shell.openExternal(`file://${filePath}`);
+    return { ok: true, path: filePath };
+  } catch (error) {
+    console.error('Failed to open report externally:', error);
+    return { ok: false, error: String(error?.message || error) };
   }
 });
 

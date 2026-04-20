@@ -76,6 +76,7 @@ export const statsApi = {
   anova: (cacheKey: string, variable: string, groupingVariable: string) =>
     api.post(`/statistics/anova?cache_key=${cacheKey}&variable=${variable}&grouping_variable=${groupingVariable}`),
   correlation: (request: CorrelationRequest) => api.post('/statistics/correlation', request),
+  scatter: (request: ScatterRequest) => api.post('/statistics/scatter', request),
   survival: (request: SurvivalAnalysisRequest) => api.post('/statistics/survival', request),
   descriptive: (cacheKey: string, variables: string[]) =>
     api.post(`/statistics/descriptive?cache_key=${cacheKey}`, variables),
@@ -155,6 +156,14 @@ export interface CorrelationRequest {
   cache_key: string;
   variables: string[];
   method?: string;
+}
+
+export interface ScatterRequest {
+  cache_key: string;
+  x_variable: string;
+  y_variable: string;
+  method?: 'pearson' | 'spearman' | 'kendall';
+  max_points?: number;
 }
 
 export interface SurvivalAnalysisRequest {

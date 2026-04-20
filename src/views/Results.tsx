@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
@@ -10,7 +10,6 @@ import {
   ExternalLink,
   Share2,
   RefreshCw,
-  X,
   Loader2,
 } from 'lucide-react';
 import Card, { CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/Card';
@@ -71,9 +70,7 @@ export default function Results() {
   const [modelResults, setModelResults] = useState<ModelResults | null>(null);
   const [loading, setLoading] = useState(false);
   const [resultsLoading, setResultsLoading] = useState(true);
-  const [reportHtml, setReportHtml] = useState<string | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
-  const iframeRef = useRef<HTMLIFrameElement>(null);
 
   useEffect(() => {
     if (!project || !analysis.modelId) {
@@ -181,7 +178,26 @@ export default function Results() {
     setReportLoading(true);
     try {
       const response = await analysisApi.getReport(analysis.modelId);
-      setReportHtml(response.data);
+      const html: string = response.data;
+
+      // In Electron: write to a temp .html and hand off to the OS so the
+      // report renders in the user's default browser, not in our window.
+      // In a plain browser dev session: blob URL + window.open as a fallback.
+      if (window.electronAPI?.openReportHtml) {
+        const result = await window.electronAPI.openReportHtml(html);
+        if (!result.ok) {
+          addToast(`Failed to open report: ${result.error || 'unknown error'}`, 'error');
+        }
+      } else {
+        const blob = new Blob([html], { type: 'text/html' });
+        const url = URL.createObjectURL(blob);
+        const opened = window.open(url, '_blank', 'noopener,noreferrer');
+        if (!opened) {
+          addToast('Pop-up blocked — allow pop-ups to view the report', 'error');
+        }
+        // Revoke after the new tab has had time to load.
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      }
     } catch (error) {
       addToast('Failed to generate report', 'error');
     } finally {
@@ -222,21 +238,32 @@ export default function Results() {
         </div>
       ) : (
         <>
-          {/* Top Metrics Row */}
-          <div className={clsx('grid gap-4 mb-6', `grid-cols-${Math.min(metrics.length, 7)}`)}>
+          {/* Top Metrics Row.
+              NOTE: grid-cols-N must be a static string for Tailwind's JIT
+              scanner to emit the rule. Previously this used
+              `grid-cols-${count}`, which produced no CSS and silently
+              collapsed every card to one-per-row. */}
+          <div
+            className="grid gap-2 mb-6"
+            style={{
+              gridTemplateColumns: `repeat(${Math.max(metrics.length, 1)}, minmax(0, 1fr))`,
+            }}
+          >
             {metrics.map((metric, index) => (
               <motion.div
                 key={metric.name}
-                initial={{ opacity: 0, y: 20 }}
+                initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: index * 0.1 }}
+                transition={{ delay: index * 0.04 }}
               >
                 <Card variant="glass" padding="sm">
-                  <CardContent className="text-center py-4">
-                    <p className="text-3xl font-bold" style={{ color: metric.color }}>
+                  <CardContent className="text-center px-2 py-2">
+                    <p className="text-xl font-bold leading-tight" style={{ color: metric.color }}>
                       {(metric.value * 100).toFixed(1)}%
                     </p>
-                    <p className="text-sm text-pie-text-muted mt-1">{metric.name}</p>
+                    <p className="text-[11px] uppercase tracking-wide text-pie-text-muted mt-0.5">
+                      {metric.name}
+                    </p>
                   </CardContent>
                 </Card>
               </motion.div>
@@ -504,29 +531,6 @@ export default function Results() {
         </Button>
       </div>
 
-      {/* Full Report Modal */}
-      {reportHtml && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-          <div className="relative w-[90vw] h-[90vh] bg-white rounded-xl shadow-2xl flex flex-col">
-            <div className="flex items-center justify-between px-6 py-3 border-b border-gray-200 bg-gray-50 rounded-t-xl">
-              <h2 className="text-lg font-semibold text-gray-800">Classification Report</h2>
-              <button
-                onClick={() => setReportHtml(null)}
-                className="p-1 rounded hover:bg-gray-200 transition-colors"
-              >
-                <X className="w-5 h-5 text-gray-600" />
-              </button>
-            </div>
-            <iframe
-              ref={iframeRef}
-              srcDoc={reportHtml}
-              className="flex-1 w-full rounded-b-xl"
-              title="Classification Report"
-              sandbox="allow-same-origin"
-            />
-          </div>
-        </div>
-      )}
     </div>
   );
 }
