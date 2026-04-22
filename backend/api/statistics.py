@@ -75,6 +75,9 @@ def _to_jsonable(obj):
     if isinstance(obj, np.floating):
         v = float(obj)
         return v if not (np.isnan(v) or np.isinf(v)) else None
+    if isinstance(obj, float):
+        # pie.stats returns Python floats; NaN/Inf are not JSON-compliant.
+        return obj if not (obj != obj or obj in (float("inf"), float("-inf"))) else None
     if isinstance(obj, np.ndarray):
         return [_to_jsonable(x) for x in obj.tolist()]
     if isinstance(obj, dict):
