@@ -543,3 +543,405 @@ def _interpret_correlation(r: float, p_value: float) -> str:
     significance = "statistically significant" if p_value < 0.05 else "not statistically significant"
 
     return f"There is a {strength} {direction} correlation (r = {r:.4f}), which is {significance} (p = {p_value:.4f})."
+
+
+# ===========================================================================
+# Classical statistics suite — thin adapters over pie.stats
+# ===========================================================================
+
+def _load_df(cache_key: str, columns: Optional[List[str]] = None) -> pd.DataFrame:
+    """Load cached data as a DataFrame, optionally restricted to ``columns``.
+
+    404s on unknown cache; raises HTTPException instead of silently returning
+    an empty frame so the UI can show a proper error.
+    """
+    if not disk_cache.exists(cache_key) and not disk_cache.is_modular(cache_key):
+        raise HTTPException(status_code=404, detail=f"Data not found: {cache_key}")
+    if columns and disk_cache.is_modular(cache_key):
+        return disk_cache.load_columns(cache_key, columns)
+    return disk_cache.load(cache_key)
+
+
+# -------- Describe ---------------------------------------------------------
+
+class DescribeRequest(BaseModel):
+    cache_key: str
+    variables: List[str]
+
+
+class NormalityRequest(BaseModel):
+    cache_key: str
+    variable: str
+    test: str = "shapiro"
+
+
+@router.post("/describe/summary")
+async def describe_summary(request: DescribeRequest):
+    from pie.stats import summary_statistics
+    df = _load_df(request.cache_key, request.variables)
+    try:
+        return _to_jsonable(summary_statistics(df, request.variables))
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/describe/normality")
+async def describe_normality(request: NormalityRequest):
+    from pie.stats import normality_test
+    df = _load_df(request.cache_key, [request.variable])
+    if request.variable not in df.columns:
+        raise HTTPException(status_code=404, detail=f"column {request.variable!r} not found")
+    try:
+        return _to_jsonable(normality_test(df[request.variable], test=request.test))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/describe/missingness")
+async def describe_missingness(request: DescribeRequest):
+    from pie.stats import missingness_report
+    df = _load_df(request.cache_key, request.variables if request.variables else None)
+    return _to_jsonable(missingness_report(df, request.variables or None))
+
+
+# -------- Compare ----------------------------------------------------------
+
+class TwoGroupRequest(BaseModel):
+    cache_key: str
+    variable: str
+    grouping_variable: str
+    test: str = "auto"
+
+
+class MultiGroupRequest(BaseModel):
+    cache_key: str
+    variable: str
+    grouping_variable: str
+    test: str = "auto"
+    posthoc: Optional[str] = None
+
+
+class CategoricalRequest(BaseModel):
+    cache_key: str
+    variable_a: str
+    variable_b: str
+    test: str = "auto"
+
+
+@router.post("/compare/two_group")
+async def compare_two_group(request: TwoGroupRequest):
+    from pie.stats import compare as C
+    df = _load_df(request.cache_key, [request.variable, request.grouping_variable])
+    levels = df[request.grouping_variable].dropna().unique()
+    if len(levels) != 2:
+        raise HTTPException(status_code=400, detail=f"need exactly 2 levels, got {len(levels)}")
+    a = df.loc[df[request.grouping_variable] == levels[0], request.variable]
+    b = df.loc[df[request.grouping_variable] == levels[1], request.variable]
+    table = {
+        "auto": C.independent_ttest, "independent_t": C.independent_ttest,
+        "welch_t": C.welch_ttest, "paired_t": C.paired_ttest,
+        "mann_whitney": C.mann_whitney, "wilcoxon": C.wilcoxon_signed_rank,
+    }
+    fn = table.get(request.test)
+    if fn is None:
+        raise HTTPException(status_code=400, detail=f"unknown test {request.test}")
+    try:
+        result = fn(a.values, b.values)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    result["group_labels"] = [str(levels[0]), str(levels[1])]
+    return _to_jsonable(result)
+
+
+@router.post("/compare/multi_group")
+async def compare_multi_group(request: MultiGroupRequest):
+    from pie.stats import compare as C
+    df = _load_df(request.cache_key, [request.variable, request.grouping_variable])
+    groups = {str(k): v[request.variable].values for k, v in df.groupby(request.grouping_variable)}
+    if len(groups) < 2:
+        raise HTTPException(status_code=400, detail="need at least 2 groups")
+    main = C.one_way_anova(groups) if request.test in ("auto", "anova") else C.kruskal_wallis(groups)
+    posthoc_result = None
+    if request.posthoc == "tukey":
+        posthoc_result = C.tukey_hsd(groups)
+    elif request.posthoc == "dunn":
+        posthoc_result = C.dunn_posthoc(groups)
+    return _to_jsonable({"main": main, "posthoc": posthoc_result})
+
+
+@router.post("/compare/categorical")
+async def compare_categorical(request: CategoricalRequest):
+    from pie.stats import compare as C
+    df = _load_df(request.cache_key, [request.variable_a, request.variable_b])
+    ct = pd.crosstab(df[request.variable_a], df[request.variable_b])
+    base = {
+        "contingency": ct.values.tolist(),
+        "row_labels": [str(x) for x in ct.index],
+        "col_labels": [str(x) for x in ct.columns],
+    }
+    if request.test == "fisher" or (
+        request.test == "auto" and ct.shape == (2, 2) and (ct < 5).any().any()
+    ):
+        base.update(C.fisher_exact(ct.values.tolist()))
+    else:
+        base.update(C.chi_square(ct.values.tolist()))
+    return _to_jsonable(base)
+
+
+# -------- Correlate --------------------------------------------------------
+
+class PartialCorrRequest(BaseModel):
+    cache_key: str
+    x: str
+    y: str
+    covariates: List[str]
+    method: str = "pearson"
+
+
+class MatrixCorrRequest(BaseModel):
+    cache_key: str
+    variables: List[str]
+    method: str = "pearson"
+
+
+@router.post("/correlate/partial")
+async def correlate_partial(request: PartialCorrRequest):
+    from pie.stats import partial_correlation
+    df = _load_df(request.cache_key, [request.x, request.y, *request.covariates])
+    return _to_jsonable(partial_correlation(df, request.x, request.y,
+                                            request.covariates, method=request.method))
+
+
+@router.post("/correlate/matrix")
+async def correlate_matrix(request: MatrixCorrRequest):
+    from pie.stats import correlation_matrix
+    df = _load_df(request.cache_key, request.variables)
+    return _to_jsonable(correlation_matrix(df, request.variables, method=request.method))
+
+
+# -------- Regress ----------------------------------------------------------
+
+class LinearRegRequest(BaseModel):
+    cache_key: str
+    outcome: str
+    predictors: List[str]
+    standardize: bool = False
+
+
+class LogisticRegRequest(BaseModel):
+    cache_key: str
+    outcome: str
+    predictors: List[str]
+
+
+class ANCOVARequest(BaseModel):
+    cache_key: str
+    outcome: str
+    group: str
+    covariates: List[str]
+
+
+@router.post("/regress/linear")
+async def regress_linear(request: LinearRegRequest):
+    from pie.stats import linear_regression
+    df = _load_df(request.cache_key, [request.outcome, *request.predictors])
+    try:
+        return _to_jsonable(linear_regression(df, request.outcome, request.predictors,
+                                              standardize=request.standardize))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/regress/logistic")
+async def regress_logistic(request: LogisticRegRequest):
+    from pie.stats import logistic_regression
+    df = _load_df(request.cache_key, [request.outcome, *request.predictors])
+    try:
+        return _to_jsonable(logistic_regression(df, request.outcome, request.predictors))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/regress/ancova")
+async def regress_ancova(request: ANCOVARequest):
+    from pie.stats import ancova
+    df = _load_df(request.cache_key, [request.outcome, request.group, *request.covariates])
+    try:
+        return _to_jsonable(ancova(df, request.outcome, request.group, request.covariates))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# -------- Longitudinal -----------------------------------------------------
+
+class LMMRequest(BaseModel):
+    cache_key: str
+    outcome: str
+    fixed_effects: List[str]
+    group: str
+    random_slopes: Optional[List[str]] = None
+
+
+class ChangeRequest(BaseModel):
+    cache_key: str
+    subject: str
+    time: str
+    outcome: str
+    baseline_time: Any = 0
+
+
+@router.post("/longitudinal/mixed_model")
+async def longitudinal_lmm(request: LMMRequest):
+    from pie.stats import linear_mixed_model
+    cols = [request.outcome, request.group, *request.fixed_effects]
+    if request.random_slopes:
+        cols.extend(request.random_slopes)
+    df = _load_df(request.cache_key, cols)
+    try:
+        return _to_jsonable(linear_mixed_model(
+            df, request.outcome, request.fixed_effects, request.group, request.random_slopes
+        ))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/longitudinal/change_from_baseline")
+async def longitudinal_change(request: ChangeRequest):
+    from pie.stats import change_from_baseline
+    df = _load_df(request.cache_key, [request.subject, request.time, request.outcome])
+    try:
+        return _to_jsonable(change_from_baseline(
+            df, request.subject, request.time, request.outcome, request.baseline_time
+        ))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# -------- Survive (new endpoints — old /survival remains for back-compat) --
+
+class SurviveKMRequest(BaseModel):
+    cache_key: str
+    time: str
+    event: str
+    group: Optional[str] = None
+
+
+class LogRankRequest(BaseModel):
+    cache_key: str
+    time: str
+    event: str
+    group: str
+
+
+class CoxRequest(BaseModel):
+    cache_key: str
+    time: str
+    event: str
+    covariates: List[str]
+
+
+@router.post("/survive/km")
+async def survive_km(request: SurviveKMRequest):
+    from pie.stats import kaplan_meier
+    cols = [request.time, request.event] + ([request.group] if request.group else [])
+    df = _load_df(request.cache_key, cols)
+    return _to_jsonable(kaplan_meier(df, request.time, request.event, request.group))
+
+
+@router.post("/survive/logrank")
+async def survive_logrank(request: LogRankRequest):
+    from pie.stats import logrank_test
+    df = _load_df(request.cache_key, [request.time, request.event, request.group])
+    return _to_jsonable(logrank_test(df, request.time, request.event, request.group))
+
+
+@router.post("/survive/cox")
+async def survive_cox(request: CoxRequest):
+    from pie.stats import cox_regression
+    df = _load_df(request.cache_key, [request.time, request.event, *request.covariates])
+    try:
+        return _to_jsonable(cox_regression(df, request.time, request.event, request.covariates))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# -------- Multitest --------------------------------------------------------
+
+class MultitestRequest(BaseModel):
+    p_values: List[float]
+    method: str = "fdr_bh"
+    alpha: float = 0.05
+
+
+@router.post("/multitest/adjust")
+async def multitest_adjust(request: MultitestRequest):
+    from pie.stats import adjust_pvalues
+    try:
+        return _to_jsonable(adjust_pvalues(request.p_values, method=request.method,
+                                           alpha=request.alpha))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# -------- PD helpers -------------------------------------------------------
+
+class LEDDRequest(BaseModel):
+    doses_mg: Dict[str, float]
+
+
+class UPDRSRequest(BaseModel):
+    cache_key: str
+    part1_cols: Optional[List[str]] = None
+    part2_cols: Optional[List[str]] = None
+    part3_cols: Optional[List[str]] = None
+    part4_cols: Optional[List[str]] = None
+
+
+class HoehnYahrRequest(BaseModel):
+    cache_key: str
+    variable: str
+
+
+@router.post("/pd/ledd")
+async def pd_ledd(request: LEDDRequest):
+    from pie.stats import compute_ledd
+    return _to_jsonable(compute_ledd(request.doses_mg))
+
+
+@router.get("/pd/ledd_factors")
+async def pd_ledd_factors():
+    """Return the supported drug→factor map so the UI can render a dropdown."""
+    from pie.stats.pd_helpers import LEDD_FACTORS
+    return {"factors": LEDD_FACTORS}
+
+
+@router.post("/pd/updrs")
+async def pd_updrs(request: UPDRSRequest):
+    from pie.stats import aggregate_updrs
+    parts = [c for c in (request.part1_cols, request.part2_cols,
+                         request.part3_cols, request.part4_cols) if c]
+    all_cols = [c for grp in parts for c in grp]
+    df = _load_df(request.cache_key, all_cols)
+    result = aggregate_updrs(
+        df,
+        part1_cols=request.part1_cols,
+        part2_cols=request.part2_cols,
+        part3_cols=request.part3_cols,
+        part4_cols=request.part4_cols,
+    )
+    # Return a head preview + summary stats so the UI doesn't receive a huge payload.
+    preview = result.head(20).to_dict(orient="records")
+    summary = result.describe().to_dict() if len(result) else {}
+    return _to_jsonable({
+        "n_rows": int(len(result)),
+        "columns": list(result.columns),
+        "preview": preview,
+        "summary": summary,
+    })
+
+
+@router.post("/pd/hoehn_yahr")
+async def pd_hoehn_yahr(request: HoehnYahrRequest):
+    from pie.stats import hoehn_yahr_summary
+    df = _load_df(request.cache_key, [request.variable])
+    return _to_jsonable(hoehn_yahr_summary(df[request.variable]))

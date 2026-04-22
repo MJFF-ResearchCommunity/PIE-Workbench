@@ -80,6 +80,63 @@ export const statsApi = {
   survival: (request: SurvivalAnalysisRequest) => api.post('/statistics/survival', request),
   descriptive: (cacheKey: string, variables: string[]) =>
     api.post(`/statistics/descriptive?cache_key=${cacheKey}`, variables),
+
+  // --- Describe ---
+  describeSummary: (cacheKey: string, variables: string[]) =>
+    api.post('/statistics/describe/summary', { cache_key: cacheKey, variables }),
+  describeNormality: (cacheKey: string, variable: string, test: string = 'shapiro') =>
+    api.post('/statistics/describe/normality', { cache_key: cacheKey, variable, test }),
+  describeMissingness: (cacheKey: string, variables: string[]) =>
+    api.post('/statistics/describe/missingness', { cache_key: cacheKey, variables }),
+
+  // --- Compare ---
+  compareTwoGroup: (payload: { cache_key: string; variable: string; grouping_variable: string; test?: string }) =>
+    api.post('/statistics/compare/two_group', payload),
+  compareMultiGroup: (payload: { cache_key: string; variable: string; grouping_variable: string; test?: string; posthoc?: string | null }) =>
+    api.post('/statistics/compare/multi_group', payload),
+  compareCategorical: (payload: { cache_key: string; variable_a: string; variable_b: string; test?: string }) =>
+    api.post('/statistics/compare/categorical', payload),
+
+  // --- Correlate ---
+  correlatePartial: (payload: { cache_key: string; x: string; y: string; covariates: string[]; method?: string }) =>
+    api.post('/statistics/correlate/partial', payload),
+  correlateMatrix: (payload: { cache_key: string; variables: string[]; method?: string }) =>
+    api.post('/statistics/correlate/matrix', payload),
+
+  // --- Regress ---
+  regressLinear: (payload: { cache_key: string; outcome: string; predictors: string[]; standardize?: boolean }) =>
+    api.post('/statistics/regress/linear', payload),
+  regressLogistic: (payload: { cache_key: string; outcome: string; predictors: string[] }) =>
+    api.post('/statistics/regress/logistic', payload),
+  regressAncova: (payload: { cache_key: string; outcome: string; group: string; covariates: string[] }) =>
+    api.post('/statistics/regress/ancova', payload),
+
+  // --- Longitudinal ---
+  longitudinalLMM: (payload: { cache_key: string; outcome: string; fixed_effects: string[]; group: string; random_slopes?: string[] | null }) =>
+    api.post('/statistics/longitudinal/mixed_model', payload),
+  longitudinalChange: (payload: { cache_key: string; subject: string; time: string; outcome: string; baseline_time?: unknown }) =>
+    api.post('/statistics/longitudinal/change_from_baseline', payload),
+
+  // --- Survive (new) ---
+  surviveKM: (payload: { cache_key: string; time: string; event: string; group?: string | null }) =>
+    api.post('/statistics/survive/km', payload),
+  surviveLogrank: (payload: { cache_key: string; time: string; event: string; group: string }) =>
+    api.post('/statistics/survive/logrank', payload),
+  surviveCox: (payload: { cache_key: string; time: string; event: string; covariates: string[] }) =>
+    api.post('/statistics/survive/cox', payload),
+
+  // --- Multitest ---
+  multitestAdjust: (payload: { p_values: number[]; method?: string; alpha?: number }) =>
+    api.post('/statistics/multitest/adjust', payload),
+
+  // --- PD Helpers ---
+  pdLedd: (doses_mg: Record<string, number>) =>
+    api.post('/statistics/pd/ledd', { doses_mg }),
+  pdLeddFactors: () => api.get('/statistics/pd/ledd_factors'),
+  pdUpdrs: (payload: { cache_key: string; part1_cols?: string[]; part2_cols?: string[]; part3_cols?: string[]; part4_cols?: string[] }) =>
+    api.post('/statistics/pd/updrs', payload),
+  pdHoehnYahr: (payload: { cache_key: string; variable: string }) =>
+    api.post('/statistics/pd/hoehn_yahr', payload),
 };
 
 // Health check

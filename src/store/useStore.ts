@@ -66,6 +66,10 @@ interface AppStore {
   toasts: Toast[];
   addToast: (message: string, type: Toast['type']) => void;
   removeToast: (id: string) => void;
+
+  // Cross-tab p-value hand-off for the Multitest correction utility
+  lastPValues: number[];
+  setLastPValues: (p: number[]) => void;
   
   // Persistence
   saveProject: () => void;
@@ -161,6 +165,10 @@ export const useStore = create<AppStore>((set, get) => ({
   removeToast: (id) => set((state) => ({
     toasts: state.toasts.filter((t) => t.id !== id),
   })),
+
+  // Cross-tab p-value hand-off
+  lastPValues: [],
+  setLastPValues: (p) => set({ lastPValues: p }),
   
   // Persistence — sync frontend state to backend, which auto-saves to .pie
   saveProject: () => {

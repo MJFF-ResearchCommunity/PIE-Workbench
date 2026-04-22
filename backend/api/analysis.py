@@ -131,6 +131,10 @@ class TrainModelRequest(BaseModel):
     target_column: str
     task_type: str = "classification"  # classification, regression
     models_to_compare: List[str] = []
+    # Per-ensemble base-learner configs: {ensemble_id: [base_model_ids]}. Only
+    # populated when the user selects a meta-ensemble (bagging, stacking, etc.)
+    # in the Model Arena and picks its underlying estimators.
+    ensemble_configs: Dict[str, List[str]] = {}
     n_models: int = 5
     tune_best: bool = False
     time_budget_minutes: float = 30.0
@@ -221,49 +225,186 @@ async def get_feature_selection_methods():
     return {"methods": methods}
 
 
+# Fallback family assignments for models sourced from the classifier.py static
+# catalog (which lacks a `family` field). Used only when endgame's ModelInfo
+# isn't available for a given id.
+_STATIC_FAMILY_BY_ID: Dict[str, str] = {
+    # Classification + regression shared ids
+    "lr": "linear",
+    "ridge": "linear",
+    "lasso": "linear",
+    "elastic_net": "linear",
+    "lda": "linear",
+    "qda": "linear",
+    "rf": "tree",
+    "et": "tree",
+    "dt": "tree",
+    "gbc": "gbdt",
+    "ada": "ensemble",
+    "xgboost": "gbdt",
+    "lightgbm": "gbdt",
+    "catboost": "gbdt",
+    "knn": "kernel",
+    "svm": "kernel",
+    "nb": "bayesian",
+    "ebm": "ensemble",
+    "tabnet": "neural",
+    "saint": "neural",
+    "ft_transformer": "neural",
+    "node": "neural",
+    "rule_fit": "rules",
+}
+
+
+def _family_for(model_id: str, info: Any) -> str:
+    """Derive the model family (e.g. 'tree', 'linear') from a catalog entry."""
+    if isinstance(info, dict):
+        return info.get("family") or _STATIC_FAMILY_BY_ID.get(model_id, "other")
+    # endgame ModelInfo dataclass
+    return getattr(info, "family", None) or _STATIC_FAMILY_BY_ID.get(model_id, "other")
+
+
+def _interpretable_for(info: Any) -> bool:
+    if isinstance(info, dict):
+        return bool(info.get("interpretable", False))
+    return bool(getattr(info, "interpretable", False))
+
+
+def _display_name_for(model_id: str, info: Any) -> str:
+    """Prefer display_name for endgame ModelInfo, else name/id."""
+    if isinstance(info, dict):
+        return info.get("name", model_id)
+    return getattr(info, "display_name", None) or getattr(info, "name", model_id)
+
+
+# Ensemble meta-methods from endgame.ensemble — these wrap user-selected base
+# learners and are surfaced as individually-selectable models in the Ensemble
+# family. Each entry carries `accepts_base_learners=True` so the UI renders a
+# sub-picker for the underlying estimators.
+_ENSEMBLE_META_METHODS: List[Dict[str, Any]] = [
+    {"id": "bagging", "name": "Bagging", "class_path": "endgame.ensemble.bagging.BaggingClassifier"},
+    {"id": "stacking", "name": "Stacking", "class_path": "endgame.ensemble.stacking.StackingEnsemble"},
+    {"id": "super_learner", "name": "Super Learner", "class_path": "endgame.ensemble.super_learner.SuperLearner"},
+    {"id": "blending", "name": "Blending", "class_path": "endgame.ensemble.blending.BlendingEnsemble"},
+    {"id": "voting", "name": "Voting", "class_path": "endgame.ensemble.voting.VotingClassifier"},
+    {"id": "bma", "name": "Bayesian Model Averaging", "class_path": "endgame.ensemble.bayesian_averaging.BayesianModelAveraging"},
+    {"id": "hill_climbing", "name": "Hill Climbing", "class_path": "endgame.ensemble.hill_climbing.HillClimbingEnsemble"},
+    {"id": "snapshot", "name": "Snapshot Ensemble", "class_path": "endgame.ensemble.snapshot.SnapshotEnsemble"},
+    {"id": "cascade", "name": "Cascade Ensemble", "class_path": "endgame.ensemble.cascade.CascadeEnsemble"},
+    {"id": "neg_corr", "name": "Negative Correlation", "class_path": "endgame.ensemble.negative_correlation.NegativeCorrelationEnsemble"},
+]
+
+_ENSEMBLE_METHOD_IDS = frozenset(m["id"] for m in _ENSEMBLE_META_METHODS)
+
+# Map UI ensemble ids → methods understood by Classifier.create_ensemble.
+# create_ensemble currently implements: super_learner, bma, blending, bagging,
+# boosting. Ids not in this map fall back to super_learner (a safe default for
+# generic meta-ensembles like hill_climbing / snapshot / cascade that the
+# Classifier doesn't yet support natively).
+_ENSEMBLE_ID_TO_PIE_METHOD: Dict[str, str] = {
+    "bagging": "bagging",
+    "stacking": "super_learner",
+    "super_learner": "super_learner",
+    "blending": "blending",
+    "voting": "super_learner",
+    "bma": "bma",
+    "hill_climbing": "super_learner",
+    "snapshot": "super_learner",
+    "cascade": "super_learner",
+    "neg_corr": "super_learner",
+}
+
+
+def _ensemble_is_importable(class_path: str) -> bool:
+    """Check whether an ensemble class exists on disk without instantiating it
+    (ensemble meta-learners require base_estimators, so we can't just call ())."""
+    if "." not in class_path:
+        return False
+    module_name, cls_name = class_path.rsplit(".", 1)
+    try:
+        import importlib
+        mod = importlib.import_module(module_name)
+        return hasattr(mod, cls_name)
+    except Exception:
+        return False
+
+
 @router.get("/available_models")
 async def get_available_models(task_type: str = "classification"):
-    """Get available ML models from endgame's dynamic catalog."""
+    """Get available ML models from endgame's dynamic catalog.
+
+    Deduplicates by display_name so that models registered under multiple
+    ids (e.g. 'xgboost' from the sklearn catalog and 'xgb' from the endgame
+    registry) only appear once. Shorter ids win (proxy for canonical).
+    Ensemble meta-methods (bagging, stacking, super learner, etc.) are
+    appended from the static `_ENSEMBLE_META_METHODS` list and carry an
+    `accepts_base_learners` flag so the UI can render a base-learner picker.
+    """
     try:
         from pie.classifier import get_model_catalog
         catalog = get_model_catalog(task_type)
-        models = [
-            {"id": k, "name": v.get("name", k) if isinstance(v, dict) else getattr(v, "name", k)}
-            for k, v in catalog.items()
-        ]
-        return {"models": models}
+        by_name: Dict[str, Dict[str, Any]] = {}
+        for k, v in catalog.items():
+            name = _display_name_for(k, v)
+            entry = {
+                "id": k,
+                "name": name,
+                "family": _family_for(k, v),
+                "interpretable": _interpretable_for(v),
+                "accepts_base_learners": False,
+            }
+            existing = by_name.get(name)
+            if existing is None or len(k) < len(existing["id"]):
+                by_name[name] = entry
+
+        # Append ensemble meta-methods (only those importable on this env)
+        for meta in _ENSEMBLE_META_METHODS:
+            if not _ensemble_is_importable(meta["class_path"]):
+                continue
+            # Don't clobber a same-name entry if one already exists
+            if meta["name"] in by_name:
+                continue
+            by_name[meta["name"]] = {
+                "id": meta["id"],
+                "name": meta["name"],
+                "family": "ensemble",
+                "interpretable": False,
+                "accepts_base_learners": True,
+            }
+
+        return {"models": list(by_name.values())}
     except ImportError:
         # Fallback static catalog
         if task_type == "classification":
-            return {
-                "models": [
-                    {"id": "lr", "name": "Logistic Regression"},
-                    {"id": "rf", "name": "Random Forest"},
-                    {"id": "xgboost", "name": "XGBoost"},
-                    {"id": "catboost", "name": "CatBoost"},
-                    {"id": "lightgbm", "name": "LightGBM"},
-                    {"id": "svm", "name": "Support Vector Machine"},
-                    {"id": "knn", "name": "K-Nearest Neighbors"},
-                    {"id": "dt", "name": "Decision Tree"},
-                    {"id": "nb", "name": "Naive Bayes"},
-                    {"id": "et", "name": "Extra Trees"},
-                ]
-            }
+            fallback = [
+                {"id": "lr", "name": "Logistic Regression"},
+                {"id": "rf", "name": "Random Forest"},
+                {"id": "xgboost", "name": "XGBoost"},
+                {"id": "catboost", "name": "CatBoost"},
+                {"id": "lightgbm", "name": "LightGBM"},
+                {"id": "svm", "name": "Support Vector Machine"},
+                {"id": "knn", "name": "K-Nearest Neighbors"},
+                {"id": "dt", "name": "Decision Tree"},
+                {"id": "nb", "name": "Naive Bayes"},
+                {"id": "et", "name": "Extra Trees"},
+            ]
         else:
-            return {
-                "models": [
-                    {"id": "lr", "name": "Linear Regression"},
-                    {"id": "rf", "name": "Random Forest"},
-                    {"id": "xgboost", "name": "XGBoost"},
-                    {"id": "catboost", "name": "CatBoost"},
-                    {"id": "lightgbm", "name": "LightGBM"},
-                    {"id": "svm", "name": "Support Vector Regression"},
-                    {"id": "knn", "name": "K-Nearest Neighbors"},
-                    {"id": "dt", "name": "Decision Tree"},
-                    {"id": "ridge", "name": "Ridge Regression"},
-                    {"id": "lasso", "name": "Lasso Regression"},
-                ]
-            }
+            fallback = [
+                {"id": "lr", "name": "Linear Regression"},
+                {"id": "rf", "name": "Random Forest"},
+                {"id": "xgboost", "name": "XGBoost"},
+                {"id": "catboost", "name": "CatBoost"},
+                {"id": "lightgbm", "name": "LightGBM"},
+                {"id": "svm", "name": "Support Vector Regression"},
+                {"id": "knn", "name": "K-Nearest Neighbors"},
+                {"id": "dt", "name": "Decision Tree"},
+                {"id": "ridge", "name": "Ridge Regression"},
+                {"id": "lasso", "name": "Lasso Regression"},
+            ]
+        for m in fallback:
+            m["family"] = _STATIC_FAMILY_BY_ID.get(m["id"], "other")
+            m["interpretable"] = False
+        return {"models": fallback}
 
 
 @router.post("/suggest_task_type")
@@ -905,15 +1046,29 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
             gc.collect()
 
             _check_cancelled(task_id)
+
+            # Split the user's model selection into regular models (trained via
+            # compare_models) and ensemble meta-methods (built separately from
+            # user-specified base learners, after the regular CV loop).
+            ensemble_ids = set(_ENSEMBLE_METHOD_IDS)
+            regular_models = [m for m in request.models_to_compare if m not in ensemble_ids]
+            ensemble_models = [m for m in request.models_to_compare if m in ensemble_ids]
+
             compare_kwargs = dict(
                 n_select=1,
                 budget_time=request.time_budget_minutes,
                 verbose=False,
             )
-            if request.models_to_compare:
-                compare_kwargs["include"] = request.models_to_compare
+            if regular_models:
+                compare_kwargs["include"] = regular_models
                 _update_task(task_id, progress=0.4,
-                             message=f"Comparing {len(request.models_to_compare)} selected models (CV)...")
+                             message=f"Comparing {len(regular_models)} selected models (CV)...")
+            elif request.models_to_compare and not regular_models:
+                # Only ensemble methods were picked — compare_models still
+                # needs at least one base comparison, so use endgame's default
+                # short list to pick the "best" non-ensemble baseline.
+                _update_task(task_id, progress=0.4,
+                             message="No regular models selected — running default comparison for best baseline...")
             else:
                 _update_task(task_id, progress=0.4, message="Comparing models (auto-pilot)...")
 
@@ -935,7 +1090,7 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
                 _update_task(task_id, message="Tuning complete")
 
             _check_cancelled(task_id)
-            _update_task(task_id, progress=0.9, message="Generating predictions on test set...")
+            _update_task(task_id, progress=0.85, message="Generating predictions on test set...")
 
             # Use the classifier's stored _X_test (already a copy made during
             # setup_experiment) rather than re-passing test_data — that local
@@ -946,13 +1101,78 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
             predictions_shape = list(predictions.shape)
             del predictions  # large per-row score frame, no longer needed
 
+            # -------- Ensemble meta-methods ----------------------------------
+            # For each ensemble the user selected, build it from their chosen
+            # base learners and fit. Each failure is logged and skipped so one
+            # broken ensemble can't sink the whole run.
+            ensemble_results: List[Dict[str, Any]] = []
+            if ensemble_models:
+                from pie.classifier import _instantiate_model  # type: ignore
+                for i, ens_id in enumerate(ensemble_models):
+                    _check_cancelled(task_id)
+                    base_ids = request.ensemble_configs.get(ens_id, [])
+                    if not base_ids:
+                        _update_task(
+                            task_id,
+                            message=f"Skipping {ens_id}: no base learners configured",
+                        )
+                        continue
+                    progress = 0.85 + 0.1 * ((i + 1) / max(len(ensemble_models), 1))
+                    _update_task(
+                        task_id, progress=progress,
+                        message=f"Building {ens_id} over {len(base_ids)} base learner(s)...",
+                    )
+
+                    def _build_and_eval(ens_id=ens_id, base_ids=base_ids):
+                        base_instances = []
+                        for bid in base_ids:
+                            try:
+                                base_instances.append(_instantiate_model(bid, request.task_type))
+                            except Exception as exc:
+                                logger.warning("Ensemble %s: failed to instantiate base '%s': %s", ens_id, bid, exc)
+                        if not base_instances:
+                            raise ValueError(f"No usable base learners for {ens_id}")
+                        method = _ENSEMBLE_ID_TO_PIE_METHOD.get(ens_id, "super_learner")
+                        ens = classifier.create_ensemble(base_models=base_instances, method=method)
+                        # Score on the held-out test set so results are
+                        # comparable to the regular compare_models output.
+                        import numpy as np
+                        X_test = classifier._X_test
+                        y_test = classifier._encode_target(classifier._y_test) if classifier._y_test is not None else None
+                        try:
+                            preds = ens.predict(X_test)
+                        except Exception as exc:
+                            logger.warning("Ensemble %s predict failed: %s", ens_id, exc)
+                            return None
+                        entry: Dict[str, Any] = {
+                            "ensemble_id": ens_id,
+                            "method": method,
+                            "n_base_learners": len(base_instances),
+                        }
+                        if y_test is not None:
+                            if request.task_type == "classification":
+                                entry["accuracy"] = float(np.mean(preds == y_test))
+                            else:
+                                entry["rmse"] = float(np.sqrt(np.mean((preds - y_test) ** 2)))
+                        return entry
+
+                    try:
+                        result = await loop.run_in_executor(None, _build_and_eval)
+                        if result:
+                            ensemble_results.append(result)
+                            _update_task(task_id, message=f"{ens_id} trained: {result}")
+                    except Exception as exc:
+                        logger.exception("Ensemble %s failed", ens_id)
+                        _update_task(task_id, message=f"{ens_id} failed: {exc}")
+
             # Store the model. comparison_results is converted to a plain dict
             # so we don't keep a live pandas object around just for inspection.
             model_id = f"model_{task_id}"
             _models[model_id] = {
                 "classifier": classifier,
                 "model": best_model,
-                "comparison_results": comparison_results.to_dict() if comparison_results is not None else None
+                "comparison_results": comparison_results.to_dict() if comparison_results is not None else None,
+                "ensemble_results": ensemble_results,
             }
 
             _update_task(
@@ -963,6 +1183,7 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
                     "model_id": model_id,
                     "model_name": type(best_model).__name__,
                     "comparison_results": comparison_results.head(10).to_dict() if comparison_results is not None else None,
+                    "ensemble_results": ensemble_results,
                     "test_predictions_shape": predictions_shape,
                 },
             )
@@ -1071,6 +1292,43 @@ async def start_calibration(request: CalibrateRequest, background_tasks: Backgro
     return {"task_id": task_id, "status": "started"}
 
 
+def _calibration_metrics(y_true: np.ndarray, y_proba: np.ndarray, n_bins: int = 10) -> Dict[str, float]:
+    """Compute Brier score, log loss, and expected calibration error.
+
+    Works for both binary (n_classes=2) and multiclass probability arrays.
+    ECE uses equal-width confidence bins on the predicted class probability.
+    """
+    from sklearn.metrics import log_loss
+
+    y_true = np.asarray(y_true).astype(int)
+    y_proba = np.asarray(y_proba)
+    if y_proba.ndim == 1:
+        y_proba = np.column_stack([1.0 - y_proba, y_proba])
+
+    n_samples, n_classes = y_proba.shape
+    one_hot = np.zeros_like(y_proba)
+    one_hot[np.arange(n_samples), y_true] = 1.0
+    brier = float(np.mean(np.sum((y_proba - one_hot) ** 2, axis=1)))
+
+    labels = list(range(n_classes))
+    ll = float(log_loss(y_true, y_proba, labels=labels))
+
+    pred_class = np.argmax(y_proba, axis=1)
+    confidence = y_proba[np.arange(n_samples), pred_class]
+    correct = (pred_class == y_true).astype(float)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (confidence > lo) & (confidence <= hi) if hi < 1.0 else (confidence > lo) & (confidence <= hi + 1e-12)
+        if not mask.any():
+            continue
+        bin_conf = float(confidence[mask].mean())
+        bin_acc = float(correct[mask].mean())
+        ece += (mask.sum() / n_samples) * abs(bin_conf - bin_acc)
+
+    return {"brier": brier, "log_loss": ll, "ece": float(ece)}
+
+
 async def _calibrate_task(task_id: str, request: CalibrateRequest):
     """Background task for model calibration."""
     try:
@@ -1089,11 +1347,35 @@ async def _calibrate_task(task_id: str, request: CalibrateRequest):
             "comparison_results": model_info.get("comparison_results"),
         }
 
+        _update_task(task_id, status="running", progress=0.8, message="Evaluating calibration quality...")
+
+        diagnostics: Dict[str, Any] = {}
+        try:
+            X_test = classifier._X_test
+            y_test = classifier._y_test
+            if X_test is not None and y_test is not None and hasattr(model, "predict_proba") and hasattr(calibrated, "predict_proba"):
+                y_true = classifier._encode_target(y_test)
+                before = _calibration_metrics(y_true, model.predict_proba(X_test))
+                after = _calibration_metrics(y_true, calibrated.predict_proba(X_test))
+                diagnostics = {
+                    "before": before,
+                    "after": after,
+                    "delta": {k: after[k] - before[k] for k in before},
+                    "n_test_samples": int(len(y_true)),
+                }
+        except Exception as diag_exc:
+            logger.warning(f"Calibration diagnostics failed: {diag_exc!r}")
+            diagnostics = {"error": str(diag_exc)}
+
         _update_task(
             task_id,
             status="completed", progress=1.0,
             message=f"Calibration ({request.method}) completed",
-            result={"model_id": calibrated_model_id, "method": request.method},
+            result={
+                "model_id": calibrated_model_id,
+                "method": request.method,
+                "diagnostics": diagnostics,
+            },
         )
 
     except Exception as e:
@@ -1128,11 +1410,22 @@ async def _drift_validation_task(task_id: str, request: DriftValidationRequest):
         classifier = Classifier()
         result = classifier.validate_drift(train_data=train_data, test_data=test_data)
 
+        severity = getattr(result, "drift_severity", "unknown")
+        auc = getattr(result, "auc_score", None)
+        if severity == "none":
+            summary = f"No drift detected (AUC {auc:.3f})" if auc is not None else "No drift detected"
+        else:
+            summary = (
+                f"Drift detected — severity: {severity} (AUC {auc:.3f})"
+                if auc is not None
+                else f"Drift detected — severity: {severity}"
+            )
+
         _update_task(
             task_id,
             status="completed", progress=1.0,
             message="Drift validation completed",
-            result={"drift_result": str(result)},
+            result={"drift_result": summary},
         )
 
     except ImportError:
