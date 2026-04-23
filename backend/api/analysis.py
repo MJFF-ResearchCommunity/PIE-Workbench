@@ -1107,10 +1107,71 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
             regular_models = [m for m in request.models_to_compare if m not in ensemble_ids]
             ensemble_models = [m for m in request.models_to_compare if m in ensemble_ids]
 
+            # Per-model / per-fold updates streamed back to the UI log.
+            # CV is compare_start → (model_start → fold_start × n_folds → model_done) × n_models.
+            # Throttle fold_start emissions for huge CVs so we don't flood
+            # the log — one message per fold per model is already plenty
+            # at 10-fold × 14-model scale (140 lines).
+            def _cv_progress(event: Dict[str, Any]) -> None:
+                phase = event.get("phase")
+                if phase == "compare_start":
+                    _update_task(
+                        task_id,
+                        message=(
+                            f"CV: {event['n_models']} model(s), "
+                            f"{event['n_folds']} folds, "
+                            f"{event['n_rows']:,} rows × {event['n_features']} features"
+                        ),
+                    )
+                elif phase == "model_start":
+                    _update_task(
+                        task_id,
+                        message=(
+                            f"Training [{event['model_idx']+1}/{event['n_models']}] "
+                            f"{event['model_name']}..."
+                        ),
+                    )
+                elif phase == "fold_start":
+                    _update_task(
+                        task_id,
+                        message=(
+                            f"  {event['model_name']}: "
+                            f"fold {event['fold_idx']+1}/{event['n_folds']}"
+                        ),
+                    )
+                elif phase == "model_done":
+                    acc = event["metrics"].get("Accuracy")
+                    acc_str = f"{acc:.4f}" if isinstance(acc, (int, float)) else "?"
+                    _update_task(
+                        task_id,
+                        message=(
+                            f"Done [{event['model_idx']+1}/{event['n_models']}] "
+                            f"{event['model_name']}: Accuracy={acc_str} "
+                            f"({event['elapsed_seconds']:.1f}s)"
+                        ),
+                    )
+                elif phase == "model_failed":
+                    _update_task(
+                        task_id,
+                        message=(
+                            f"Failed [{event['model_idx']+1}/{event['n_models']}] "
+                            f"{event['model_name']}: {event['error']}"
+                        ),
+                    )
+                elif phase == "budget_exhausted":
+                    _update_task(
+                        task_id,
+                        message=(
+                            f"Time budget exhausted after "
+                            f"{event['completed_models']} model(s) — stopping CV"
+                        ),
+                    )
+
             compare_kwargs = dict(
                 n_select=1,
                 budget_time=request.time_budget_minutes,
                 verbose=False,
+                progress_callback=_cv_progress,
             )
             if regular_models:
                 compare_kwargs["include"] = regular_models
@@ -2308,6 +2369,21 @@ def _count_trees(model: Any) -> int:
         return 1
 
 
+def _can_visualize_bayesian_network(model: Any) -> bool:
+    """Whether endgame's BayesianNetworkVisualizer can render this model.
+
+    Matches the contract of ``BaseBayesianClassifier``: a fitted Bayesian
+    model that exposes ``structure_`` (networkx DiGraph).  This covers
+    TAN, KDB, ESKDB, EBMC, NeuralKDB, and AutoSLE.
+    """
+    structure_type = getattr(model, "_structure_type", None)
+    if structure_type == "bayesian_network":
+        return True
+    # Some AutoSLE / selector wrappers attach structure_ without the mixin
+    # attribute — handle both.
+    return getattr(model, "structure_", None) is not None
+
+
 def _feature_names_for_model(classifier: Any) -> Optional[List[str]]:
     """Best-effort feature-name recovery from the PIE Classifier."""
     try:
@@ -2350,6 +2426,7 @@ async def get_model_structure(model_id: str):
     feature_names = _feature_names_for_model(classifier)
     tree_viz_supported = _can_visualize_tree(model)
     n_trees = _count_trees(model) if tree_viz_supported else 0
+    bn_viz_supported = _can_visualize_bayesian_network(model)
 
     get_struct = getattr(model, "get_structure", None)
     if callable(get_struct):
@@ -2365,6 +2442,7 @@ async def get_model_structure(model_id: str):
                 "n_features": int(structure.get("n_features", len(feature_names or []))),
                 "tree_viz_supported": tree_viz_supported,
                 "n_trees": n_trees,
+                "bn_viz_supported": bn_viz_supported,
             }
         except Exception as e:
             logger.exception("get_structure() failed for model %s", model_id)
@@ -2375,6 +2453,7 @@ async def get_model_structure(model_id: str):
                 "n_features": len(feature_names or []),
                 "tree_viz_supported": tree_viz_supported,
                 "n_trees": n_trees,
+                "bn_viz_supported": bn_viz_supported,
                 "reason": f"get_structure() raised: {e}",
             }
 
@@ -2385,6 +2464,7 @@ async def get_model_structure(model_id: str):
         "n_features": len(feature_names or []),
         "tree_viz_supported": tree_viz_supported,
         "n_trees": n_trees,
+        "bn_viz_supported": bn_viz_supported,
         "reason": "Model does not implement endgame's GlassboxMixin",
     }
 
@@ -2454,3 +2534,48 @@ async def get_tree_visualization(model_id: str, tree_index: int = 0):
     except Exception as e:
         logger.exception("tree_viz failed for model %s", model_id)
         raise HTTPException(status_code=500, detail=f"Tree visualization failed: {e}")
+
+
+@router.get("/model/{model_id}/bn_viz", response_class=HTMLResponse)
+async def get_bayesian_network_visualization(model_id: str):
+    """Render endgame's interactive Bayesian-network visualizer as self-contained HTML.
+
+    Supports any model that exposes ``structure_`` (endgame's
+    BaseBayesianClassifier contract): TAN, KDB, ESKDB, EBMC, NeuralKDB, AutoSLE.
+    """
+    if model_id not in _models:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    model_info = _models[model_id]
+    model = model_info["model"]
+    classifier = model_info["classifier"]
+
+    if not _can_visualize_bayesian_network(model):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {type(model).__name__} has no fitted Bayesian network structure",
+        )
+
+    try:
+        from endgame.visualization.bayesian_network_visualizer import BayesianNetworkVisualizer
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="endgame.visualization.bayesian_network_visualizer not available",
+        )
+
+    feature_names = _feature_names_for_model(classifier)
+    class_names = _class_names_for_model(classifier)
+
+    try:
+        viz = BayesianNetworkVisualizer(
+            model,
+            feature_names=feature_names,
+            class_names=class_names,
+            title=f"{type(model).__name__} — Bayesian Network",
+        )
+        html = viz._repr_html_()
+        return HTMLResponse(content=html)
+    except Exception as e:
+        logger.exception("bn_viz failed for model %s", model_id)
+        raise HTTPException(status_code=500, detail=f"Bayesian network visualization failed: {e}")

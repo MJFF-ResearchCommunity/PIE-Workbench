@@ -114,9 +114,12 @@ ipcMain.handle('select-file', async (event, options) => {
   }
 });
 
-// Write report HTML to a temp file and open it in the user's default browser.
-// Used by the Results view's "View Full Report" button so the report renders
-// in a real browser window instead of an in-app modal iframe.
+// Write report HTML to a temp file and load it in a dedicated Electron
+// BrowserWindow.  Previously this used `shell.openExternal(file://...)` to
+// hand off to the system default browser, but on Linux when Chrome is
+// already running under a different profile that call opens a new Guest
+// window without honouring the URL — the user sees "You're browsing as a
+// Guest" and no report.  A child BrowserWindow works reliably everywhere.
 ipcMain.handle('open-report-html', async (event, html) => {
   try {
     if (typeof html !== 'string' || !html) {
@@ -125,10 +128,27 @@ ipcMain.handle('open-report-html', async (event, html) => {
     const filename = `pie-report-${Date.now()}.html`;
     const filePath = path.join(os.tmpdir(), filename);
     fs.writeFileSync(filePath, html, 'utf8');
-    await shell.openExternal(`file://${filePath}`);
+
+    const reportWindow = new BrowserWindow({
+      width: 1400,
+      height: 900,
+      minWidth: 900,
+      minHeight: 600,
+      backgroundColor: '#0a0f1a',
+      title: 'PIE Workbench — Report',
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+      },
+    });
+    reportWindow.setMenuBarVisibility(false);
+    reportWindow.loadFile(filePath);
+    reportWindow.once('ready-to-show', () => reportWindow.show());
+
     return { ok: true, path: filePath };
   } catch (error) {
-    console.error('Failed to open report externally:', error);
+    console.error('Failed to open report window:', error);
     return { ok: false, error: String(error?.message || error) };
   }
 });

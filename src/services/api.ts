@@ -65,6 +65,8 @@ export const analysisApi = {
     api.get(`/analysis/model/${modelId}/structure`),
   getTreeViz: (modelId: string, treeIndex: number = 0) =>
     longApi.get(`/analysis/model/${modelId}/tree_viz?tree_index=${treeIndex}`, { responseType: 'text' }),
+  getBayesianNetworkViz: (modelId: string) =>
+    longApi.get(`/analysis/model/${modelId}/bn_viz`, { responseType: 'text' }),
   autoML: (request: AutoMLRequest) => longApi.post('/analysis/auto_ml', request),
   calibrate: (request: CalibrateRequest) => api.post('/analysis/calibrate', request),
   validateDrift: (request: DriftValidationRequest) => api.post('/analysis/validate_drift', request),
