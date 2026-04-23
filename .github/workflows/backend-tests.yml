@@ -32,6 +32,7 @@ jobs:
           pip install -r backend/requirements.txt
           pip install -e lib/PIE
           pip install -e lib/PIE-clean
+          pip install pytest
 
       - name: Import smoke test
         working-directory: backend
