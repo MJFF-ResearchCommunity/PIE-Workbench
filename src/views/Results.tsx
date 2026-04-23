@@ -11,6 +11,11 @@ import {
   Share2,
   RefreshCw,
   Loader2,
+  GitBranch,
+  Code2,
+  ChevronDown,
+  ChevronRight,
+  Info,
 } from 'lucide-react';
 import Card, { CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/Card';
 import Button from '../components/ui/Button';
@@ -47,6 +52,16 @@ interface ModelResults {
   comparison: Record<string, Record<string, number | string>> | null;
 }
 
+interface ModelStructure {
+  supported: boolean;
+  structure: Record<string, unknown> | null;
+  model_type: string;
+  n_features: number;
+  tree_viz_supported: boolean;
+  n_trees: number;
+  reason?: string;
+}
+
 const METRIC_COLORS: Record<string, string> = {
   'Accuracy': '#ff6b4a',
   'AUC': '#4ecdc4',
@@ -62,6 +77,51 @@ const METRIC_LABELS: Record<string, string> = {
   'F1': 'F1 Score',
 };
 
+// Walks an endgame tree payload and returns basic shape stats.  Child node
+// keys vary across tree types — Oblique uses left/right, C5.0 uses branches,
+// sklearn-derived trees use children — so this does a structural walk that
+// recurses into any nested dicts, using the node's own 'depth' field when
+// present for accuracy.
+function walkTree(root: unknown): { nodes: number; leaves: number; maxDepth: number } {
+  let nodes = 0;
+  let leaves = 0;
+  let maxDepth = 0;
+  const nodeKeyHints = new Set(['type', 'depth', 'n_samples', 'impurity', 'feature', 'threshold', 'class']);
+  const isNodeLike = (n: unknown): n is Record<string, unknown> => {
+    if (!n || typeof n !== 'object' || Array.isArray(n)) return false;
+    const keys = Object.keys(n as object);
+    return keys.some((k) => nodeKeyHints.has(k));
+  };
+  // Collect every nested node-like dict under `n`, descending through
+  // non-node wrappers (e.g. C5.0's `branches:[{edge,child}]`) until a
+  // node-like dict is found.
+  const collectChildNodes = (n: unknown, out: Record<string, unknown>[]) => {
+    if (n == null || typeof n !== 'object') return;
+    if (Array.isArray(n)) {
+      for (const v of n) collectChildNodes(v, out);
+      return;
+    }
+    if (isNodeLike(n)) {
+      out.push(n);
+      return;
+    }
+    for (const v of Object.values(n)) collectChildNodes(v, out);
+  };
+  const visit = (n: Record<string, unknown>, depth: number) => {
+    nodes += 1;
+    const nodeDepth = typeof n.depth === 'number' ? (n.depth as number) : depth;
+    if (nodeDepth > maxDepth) maxDepth = nodeDepth;
+    const childNodes: Record<string, unknown>[] = [];
+    for (const v of Object.values(n)) collectChildNodes(v, childNodes);
+    if (childNodes.length === 0 || n.type === 'leaf' || n.is_leaf === true) {
+      leaves += 1;
+    }
+    for (const c of childNodes) visit(c, nodeDepth + 1);
+  };
+  if (isNodeLike(root)) visit(root, 0);
+  return { nodes, leaves, maxDepth };
+}
+
 export default function Results() {
   const navigate = useNavigate();
   const { project, analysis, addToast } = useStore();
@@ -72,6 +132,12 @@ export default function Results() {
   const [resultsLoading, setResultsLoading] = useState(true);
   const [reportLoading, setReportLoading] = useState(false);
 
+  const [structure, setStructure] = useState<ModelStructure | null>(null);
+  const [structureLoading, setStructureLoading] = useState(false);
+  const [treeVizLoading, setTreeVizLoading] = useState(false);
+  const [treeIndex, setTreeIndex] = useState(0);
+  const [showRawStructure, setShowRawStructure] = useState(false);
+
   useEffect(() => {
     if (!project || !analysis.modelId) {
       navigate('/ml');
@@ -79,6 +145,7 @@ export default function Results() {
     }
     loadFeatureImportance();
     loadModelResults();
+    loadStructure();
   }, [project, analysis.modelId, navigate]);
 
   const loadFeatureImportance = async () => {
@@ -109,6 +176,50 @@ export default function Results() {
       addToast('Failed to load model results', 'error');
     } finally {
       setResultsLoading(false);
+    }
+  };
+
+  const loadStructure = async () => {
+    if (!analysis.modelId) return;
+    setStructureLoading(true);
+    try {
+      const response = await analysisApi.getModelStructure(analysis.modelId);
+      setStructure(response.data);
+    } catch (error) {
+      console.error('Failed to load model structure:', error);
+    } finally {
+      setStructureLoading(false);
+    }
+  };
+
+  const handleOpenTreeViz = async () => {
+    if (!analysis.modelId) return;
+    setTreeVizLoading(true);
+    try {
+      const response = await analysisApi.getTreeViz(analysis.modelId, treeIndex);
+      const html: string = response.data;
+
+      // Same handoff pattern as the full report: route through Electron when
+      // available so the viz opens in the user's default browser; fall back
+      // to blob URL + window.open in a plain browser.
+      if (window.electronAPI?.openReportHtml) {
+        const result = await window.electronAPI.openReportHtml(html);
+        if (!result.ok) {
+          addToast(`Failed to open tree viz: ${result.error || 'unknown error'}`, 'error');
+        }
+      } else {
+        const blob = new Blob([html], { type: 'text/html' });
+        const url = URL.createObjectURL(blob);
+        const opened = window.open(url, '_blank', 'noopener,noreferrer');
+        if (!opened) {
+          addToast('Pop-up blocked — allow pop-ups to view the tree', 'error');
+        }
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      }
+    } catch (error) {
+      addToast('Failed to render tree visualization', 'error');
+    } finally {
+      setTreeVizLoading(false);
     }
   };
 
@@ -151,6 +262,55 @@ export default function Results() {
         importance: featureImportance.importances[i],
       })).reverse()
     : [];
+
+  // Derive a compact, type-aware summary of the glassbox structure payload.
+  // Only renders rows whose underlying key is actually present, so the card
+  // stays useful across linear / tree / additive / rules / bayesian payloads.
+  const structureSummary = useMemo<Array<{ label: string; value: string }>>(() => {
+    if (!structure?.structure) return [];
+    const s = structure.structure as Record<string, unknown>;
+    const rows: Array<{ label: string; value: string }> = [];
+    const push = (label: string, value: unknown) => {
+      if (value == null) return;
+      rows.push({ label, value: String(value) });
+    };
+
+    push('Structure type', s.structure_type);
+    push('Features', s.n_features);
+    push('Classes', s.n_classes);
+
+    const st = s.structure_type as string | undefined;
+    if (st === 'tree') {
+      const tree = s.tree as { root?: unknown } | undefined;
+      if (tree?.root) {
+        const stats = walkTree(tree.root);
+        push('Nodes', stats.nodes);
+        push('Leaves', stats.leaves);
+        push('Max depth', stats.maxDepth);
+      }
+      push('Oblique method', s.oblique_method);
+    } else if (st === 'tree_ensemble') {
+      push('Trees in ensemble', structure.n_trees);
+    } else if (st === 'linear') {
+      push('Link', s.link);
+      push('Solver', s.solver);
+      push('Penalty', s.penalty);
+    } else if (st === 'additive') {
+      push('Terms', s.n_terms);
+    } else if (st === 'rules' || st === 'fuzzy_rules') {
+      const rules = s.rules as unknown[] | undefined;
+      if (Array.isArray(rules)) push('Rules', rules.length);
+    } else if (st === 'bayesian_network') {
+      const nodes = s.nodes as unknown[] | undefined;
+      const edges = s.edges as unknown[] | undefined;
+      if (Array.isArray(nodes)) push('Nodes', nodes.length);
+      if (Array.isArray(edges)) push('Edges', edges.length);
+    } else if (st === 'boxes') {
+      const boxes = s.boxes as unknown[] | undefined;
+      if (Array.isArray(boxes)) push('Boxes', boxes.length);
+    }
+    return rows;
+  }, [structure]);
 
   const handleExportResults = async () => {
     if (!analysis.modelId) return;
@@ -514,6 +674,106 @@ export default function Results() {
               </CardContent>
             </Card>
           )}
+
+          {/* Winning Model Structure (endgame glassbox) */}
+          <Card className="mt-6">
+            <CardHeader>
+              <div className="flex items-center justify-between">
+                <div>
+                  <CardTitle className="flex items-center gap-2">
+                    <GitBranch className="w-5 h-5 text-pie-accent-secondary" />
+                    Model Structure
+                  </CardTitle>
+                  <CardDescription>
+                    Glassbox structure of the winning model via endgame&apos;s <code className="text-pie-accent">get_structure()</code>
+                  </CardDescription>
+                </div>
+                {structure?.tree_viz_supported && (
+                  <div className="flex items-center gap-2">
+                    {structure.n_trees > 1 && (
+                      <label className="flex items-center gap-2 text-xs text-pie-text-muted">
+                        Tree
+                        <input
+                          type="number"
+                          min={0}
+                          max={structure.n_trees - 1}
+                          value={treeIndex}
+                          onChange={(e) => setTreeIndex(Math.max(0, Math.min(structure.n_trees - 1, Number(e.target.value) || 0)))}
+                          className="w-16 px-2 py-1 rounded border border-pie-border bg-pie-surface text-pie-text text-xs focus:outline-none focus:ring-2 focus:ring-pie-accent/50"
+                        />
+                        <span>/ {structure.n_trees - 1}</span>
+                      </label>
+                    )}
+                    <Button variant="primary" size="sm" onClick={handleOpenTreeViz} disabled={treeVizLoading}>
+                      {treeVizLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <GitBranch className="w-4 h-4" />}
+                      {treeVizLoading ? 'Rendering...' : 'Open Tree Visualizer'}
+                    </Button>
+                  </div>
+                )}
+              </div>
+            </CardHeader>
+            <CardContent>
+              {structureLoading && !structure ? (
+                <div className="flex items-center justify-center py-6">
+                  <Loader2 className="w-6 h-6 animate-spin text-pie-accent" />
+                </div>
+              ) : structure == null ? (
+                <div className="text-sm text-pie-text-muted">No structure available.</div>
+              ) : (
+                <>
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="px-2 py-1 rounded bg-pie-accent/10 text-pie-accent text-xs font-mono">
+                      {structure.model_type}
+                    </div>
+                    {structure.supported ? (
+                      <span className="text-xs text-pie-success">Glassbox structure available</span>
+                    ) : (
+                      <span className="flex items-center gap-1 text-xs text-pie-text-muted">
+                        <Info className="w-3 h-3" />
+                        {structure.reason || 'Structure not exposed'}
+                      </span>
+                    )}
+                  </div>
+
+                  {structureSummary.length > 0 && (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 mb-4">
+                      {structureSummary.map(({ label, value }) => (
+                        <div key={label} className="px-3 py-2 rounded-lg border border-pie-border bg-pie-surface">
+                          <div className="text-[11px] uppercase tracking-wide text-pie-text-muted">{label}</div>
+                          <div className="text-sm font-mono text-pie-text mt-0.5">{value}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {!structure.tree_viz_supported && structure.structure?.structure_type != null && (
+                    <div className="text-xs text-pie-text-muted mb-2">
+                      Tree visualizer is only available for tree-based models; this model is{' '}
+                      <span className="font-mono text-pie-text">{String(structure.structure.structure_type)}</span>.
+                    </div>
+                  )}
+
+                  {structure.structure && (
+                    <div className="mt-2">
+                      <button
+                        onClick={() => setShowRawStructure((v) => !v)}
+                        className="flex items-center gap-1 text-xs text-pie-text-muted hover:text-pie-text"
+                      >
+                        {showRawStructure ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                        <Code2 className="w-3 h-3" />
+                        {showRawStructure ? 'Hide' : 'Show'} raw structure (JSON)
+                      </button>
+                      {showRawStructure && (
+                        <pre className="mt-2 p-3 rounded-lg border border-pie-border bg-pie-surface/60 text-[11px] text-pie-text overflow-auto max-h-80">
+                          {JSON.stringify(structure.structure, null, 2)}
+                        </pre>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </CardContent>
+          </Card>
         </>
       )}
 

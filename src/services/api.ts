@@ -61,10 +61,14 @@ export const analysisApi = {
   getModelResults: (modelId: string) => api.get(`/analysis/model/${modelId}/results`),
   getReport: (modelId: string) =>
     longApi.get(`/analysis/model/${modelId}/report`, { responseType: 'text' }),
+  getModelStructure: (modelId: string) =>
+    api.get(`/analysis/model/${modelId}/structure`),
+  getTreeViz: (modelId: string, treeIndex: number = 0) =>
+    longApi.get(`/analysis/model/${modelId}/tree_viz?tree_index=${treeIndex}`, { responseType: 'text' }),
   autoML: (request: AutoMLRequest) => longApi.post('/analysis/auto_ml', request),
   calibrate: (request: CalibrateRequest) => api.post('/analysis/calibrate', request),
   validateDrift: (request: DriftValidationRequest) => api.post('/analysis/validate_drift', request),
-  detectLeakage: (request: DetectLeakageRequest) => api.post('/analysis/detect_leakage', request),
+  detectLeakage: (request: DetectLeakageRequest) => longApi.post('/analysis/detect_leakage', request),
   createEnsemble: (request: EnsembleRequest) => api.post('/analysis/create_ensemble', request),
 };
 

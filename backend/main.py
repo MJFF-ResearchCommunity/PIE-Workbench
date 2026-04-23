@@ -9,12 +9,35 @@ import os
 import sys
 import resource
 import logging
+import faulthandler
+import signal
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import psutil
 
 logger = logging.getLogger(__name__)
+
+# Route logger.info() calls throughout the backend to stderr. Without this,
+# background-task progress messages and warnings disappear because Python's
+# root logger defaults to WARNING with no visible handler, leaving only
+# uvicorn's access log in the terminal.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+)
+
+# Dump a Python traceback on fatal signals (SIGSEGV/SIGABRT/SIGFPE/SIGBUS/SIGILL)
+# so native-extension crashes and RLIMIT_AS trips leave a trace on stderr instead
+# of dying silently. SIGUSR1 prints all thread stacks on demand — use
+# `kill -SIGUSR1 <pid>` to diagnose a hang without killing the process.
+faulthandler.enable()
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except (AttributeError, ValueError):
+    pass
 
 # ---------------------------------------------------------------------------
 # Memory safety: cap the process address space so that runaway allocations

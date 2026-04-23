@@ -16,11 +16,18 @@ import gc
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+
+try:
+    import psutil
+    _PROCESS = psutil.Process()
+except Exception:
+    _PROCESS = None
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse
@@ -101,6 +108,52 @@ def _update_task(task_id: str, **kwargs):
                 "timestamp": datetime.now().isoformat(),
                 "message": kwargs["message"],
             })
+        # Mirror progress to the terminal so a stalled or crashed run leaves
+        # a visible trail even when the UI is frozen or the process dies.
+        status = kwargs.get("status") or task.get("status") or "?"
+        progress = kwargs.get("progress", task.get("progress", 0.0)) or 0.0
+        logger.info(
+            "[task %s %s %3.0f%%] %s",
+            task_id[:8], status, progress * 100, kwargs["message"],
+        )
+
+
+class _Heartbeat:
+    """Context manager that logs 'alive' pings every `interval` seconds while
+    a long blocking call runs. The interval reveals stalls: a missing
+    heartbeat tells you exactly when the worker stopped making progress.
+    Includes RSS so you can watch memory climb toward the RLIMIT_AS cap."""
+
+    def __init__(self, task_id: str, stage: str, interval: float = 10.0):
+        self.tag = f"{task_id[:8]} {stage}"
+        self.interval = interval
+        self._start = time.monotonic()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _loop(self):
+        while not self._stop.wait(self.interval):
+            elapsed = time.monotonic() - self._start
+            rss = ""
+            if _PROCESS is not None:
+                try:
+                    rss = f" rss={_PROCESS.memory_info().rss / (1024 * 1024):.0f}MB"
+                except Exception:
+                    pass
+            logger.info("[heartbeat %s] elapsed=%.0fs%s", self.tag, elapsed, rss)
+
+    def __enter__(self):
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name=f"hb-{self.tag}",
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        return False
 
 
 class FeatureEngineeringRequest(BaseModel):
@@ -1072,9 +1125,10 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
             else:
                 _update_task(task_id, progress=0.4, message="Comparing models (auto-pilot)...")
 
-            best_model = await loop.run_in_executor(
-                None, lambda: classifier.compare_models(**compare_kwargs)
-            )
+            with _Heartbeat(task_id, "compare_models"):
+                best_model = await loop.run_in_executor(
+                    None, lambda: classifier.compare_models(**compare_kwargs)
+                )
 
             _check_cancelled(task_id)
             comparison_results = classifier.comparison_results
@@ -1084,9 +1138,10 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
             if request.tune_best:
                 _check_cancelled(task_id)
                 _update_task(task_id, progress=0.7, message=f"Tuning {type(best_model).__name__}...")
-                best_model = await loop.run_in_executor(
-                    None, lambda: classifier.tune_model(verbose=False)
-                )
+                with _Heartbeat(task_id, "tune_model"):
+                    best_model = await loop.run_in_executor(
+                        None, lambda: classifier.tune_model(verbose=False)
+                    )
                 _update_task(task_id, message="Tuning complete")
 
             _check_cancelled(task_id)
@@ -1095,9 +1150,10 @@ async def _train_model_task(task_id: str, request: TrainModelRequest):
             # Use the classifier's stored _X_test (already a copy made during
             # setup_experiment) rather than re-passing test_data — that local
             # has been freed to keep RAM bounded during CV.
-            predictions = await loop.run_in_executor(
-                None, lambda: classifier.predict_model(verbose=False)
-            )
+            with _Heartbeat(task_id, "predict_model"):
+                predictions = await loop.run_in_executor(
+                    None, lambda: classifier.predict_model(verbose=False)
+                )
             predictions_shape = list(predictions.shape)
             del predictions  # large per-row score frame, no longer needed
 
@@ -1435,6 +1491,65 @@ async def _drift_validation_task(task_id: str, request: DriftValidationRequest):
         _update_task(task_id, status="failed", error=str(e) or repr(e), message=f"Failed: {e!r}")
 
 
+# ---------------------------------------------------------------------------
+# Leakage helpers: Theil's U (uncertainty coefficient) for "near-target match"
+# detection.  Given two discrete series X and Y, U(Y|X) ∈ [0, 1] measures the
+# fraction of target entropy that is explained by X — i.e. how much knowing X
+# reduces uncertainty about Y.  1.0 means X perfectly determines Y.  Because
+# it is asymmetric and normalized, it's a better fit than Cramér's V or
+# Pearson correlation for "does this feature leak the target?", and naturally
+# catches the PPMI sub-study pattern where a single feature value deterministically
+# maps to one cohort class.
+# ---------------------------------------------------------------------------
+
+def _uncertainty_coefficient(x: pd.Series, y: pd.Series) -> float:
+    """Theil's U: U(y|x) ∈ [0, 1].  Returns 1.0 when x perfectly determines y."""
+    ct = pd.crosstab(x, y)
+    n = int(ct.values.sum())
+    if n == 0:
+        return 0.0
+
+    py = ct.sum(axis=0).values.astype(float) / n
+    py = py[py > 0]
+    h_y = float(-(py * np.log2(py)).sum())
+    if h_y <= 0:
+        return 0.0
+
+    px = ct.sum(axis=1).values.astype(float) / n
+    p_joint = ct.values.astype(float) / n
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cond = np.where(px[:, None] > 0, p_joint / px[:, None], 0.0)
+    log_cond = np.where(cond > 0, np.log2(np.where(cond > 0, cond, 1.0)), 0.0)
+    h_yx_per_x = -(cond * log_cond).sum(axis=1)
+    h_yx = float((px * h_yx_per_x).sum())
+
+    u = (h_y - h_yx) / h_y
+    if not np.isfinite(u):
+        return 0.0
+    return float(max(0.0, min(1.0, u)))
+
+
+def _top_value_purity(x: pd.Series, y: pd.Series, min_group: int = 20):
+    """For the (x == v) sub-group with highest target purity (and size ≥ min_group),
+    return (x_value, top_y_value, purity, group_size) or None if no such group exists.
+
+    Catches the "this sub-study only enrolls Cohort=PD" leakage pattern even when
+    the whole-feature Theil's U is moderate because the leaky value is rare.
+    """
+    ct = pd.crosstab(x, y)
+    row_sums = ct.sum(axis=1)
+    keep = row_sums[row_sums >= min_group]
+    if keep.empty:
+        return None
+    sub = ct.loc[keep.index]
+    max_counts = sub.max(axis=1)
+    purity = max_counts.values.astype(float) / keep.values.astype(float)
+    idx = int(np.argmax(purity))
+    x_val = keep.index[idx]
+    top_y = sub.iloc[idx].idxmax()
+    return (x_val, top_y, float(purity[idx]), int(keep.values[idx]))
+
+
 @router.post("/detect_leakage")
 async def detect_leakage(request: DetectLeakageRequest):
     """Scan features for potential data leakage using statistical heuristics.
@@ -1600,13 +1715,243 @@ async def detect_leakage(request: DetectLeakageRequest):
     except Exception:
         pass  # Correlation check is best-effort
 
+    # 5. Near-target match ------------------------------------------------
+    # Catch features that leak the target.  Runs three complementary checks:
+    #
+    #   a) Non-null subpopulation purity — if "having a value for this
+    #      column" overwhelmingly implies one target class (regardless of
+    #      which value), the column is a cohort-specific data flag.  This
+    #      is the PPMI sub-study pattern and Theil's U alone misses it:
+    #      after dropping nulls, the non-null subpopulation has zero target
+    #      entropy so the coefficient collapses to 0.
+    #
+    #   b) Theil's U on the feature values — high-cardinality numerics are
+    #      quantile-binned.  U ≥ 0.95 means the feature nearly determines
+    #      the target across its full distribution.
+    #
+    #   c) Per-value purity — catches a single rare feature value that
+    #      deterministically segregates one class even when (a) and (b)
+    #      miss it.
+    #
+    # Features already flagged as near_zero_variance or high_target_correlation
+    # are still eligible: a constant-looking sub-study flag is almost always
+    # the exact leak we want to surface, and this reason is more informative.
+    # When a feature gets upgraded to near_target_match we remove the prior
+    # label so it doesn't appear twice.
+    scan_stats: Dict[str, Any] = {
+        "candidates": 0,
+        "loaded": 0,
+        "flagged": 0,
+        "load_error": None,
+    }
+    try:
+        # Skip only ID-shaped columns (always useless here) and features
+        # already on the known-leakage list (already surfaced).
+        skip_names = {
+            s["name"] for s in suspicious
+            if s["reason"] in ("known_leakage", "identifier")
+        }
+        # These categories are provisional — upgrade to near_target_match
+        # when we find stronger evidence.
+        upgradeable = {
+            s["name"] for s in suspicious
+            if s["reason"] in ("near_zero_variance", "high_target_correlation")
+        }
+
+        candidates: List[Dict[str, Any]] = []
+        for c in feature_columns:
+            name = c["name"]
+            if name in skip_names:
+                continue
+            uc = c.get("unique_count")
+            if uc is None:
+                continue
+            # Cap total cardinality: anything higher is effectively an ID
+            # and is handled by step 2; loading it here would balloon
+            # memory and time without useful signal.
+            if uc > 2000:
+                continue
+            candidates.append(c)
+
+        # Bound total work so the scan stays interactive on PPMI-scale data.
+        # 1500 columns × 20k rows of object-dtype data is ~a few hundred MB
+        # through pandas + Theil's U, which finishes in seconds.
+        candidates = candidates[:1500]
+        scan_stats["candidates"] = len(candidates)
+
+        if candidates:
+            cols_to_load = [request.target_column] + [c["name"] for c in candidates]
+            df2: Optional[pd.DataFrame] = None
+            if disk_cache.is_modular(request.cache_key):
+                try:
+                    df2 = disk_cache.load_columns(request.cache_key, cols_to_load)
+                except Exception as load_exc:
+                    scan_stats["load_error"] = str(load_exc)
+                    df2 = None
+            else:
+                raw = disk_cache.load(request.cache_key)
+                if isinstance(raw, pd.DataFrame):
+                    df2 = raw[[c for c in cols_to_load if c in raw.columns]]
+
+            if df2 is not None and request.target_column in df2.columns:
+                scan_stats["loaded"] = int(df2.shape[1]) - 1
+
+                # Row-sample on very large datasets — Theil's U and purity
+                # are stable at 20k rows and this caps scan time.
+                if len(df2) > 20000:
+                    df2 = df2.sample(n=20000, random_state=42)
+
+                y_raw = df2[request.target_column]
+                y_mask = y_raw.notna()
+                df2 = df2.loc[y_mask]
+                y_raw = y_raw.loc[y_mask]
+
+                if len(y_raw) >= 30:
+                    # Discretise numeric targets (regression) into coarse
+                    # bins so they can participate in an entropy calc.
+                    if np.issubdtype(y_raw.dtype, np.number) and y_raw.nunique() > 20:
+                        try:
+                            y_cat = pd.qcut(y_raw, q=10, duplicates="drop").astype(str)
+                        except Exception:
+                            y_cat = y_raw.astype(str)
+                    else:
+                        y_cat = y_raw.astype(str)
+
+                    U_FLAG = 0.90            # "nearly determines target"
+                    VALUE_PURITY_FLAG = 0.98
+                    NONNULL_PURITY_FLAG = 0.98
+                    MIN_VALUE_GROUP = 50
+                    MIN_NONNULL_GROUP = 30
+                    NA_TOKEN = "__NA__"
+
+                    flagged_names: set[str] = set()
+
+                    for c in candidates:
+                        name = c["name"]
+                        if name not in df2.columns:
+                            continue
+                        x_raw = df2[name]
+                        nonnull_mask = x_raw.notna()
+                        n_nonnull = int(nonnull_mask.sum())
+                        if n_nonnull < MIN_NONNULL_GROUP:
+                            continue
+
+                        flagged_detail: Optional[str] = None
+
+                        # (a) Non-null subpopulation purity — the PPMI
+                        # sub-study-only-for-cohort-X case.  Only meaningful
+                        # when the non-null group is a genuine minority
+                        # (otherwise it's just the marginal distribution).
+                        nonnull_frac = n_nonnull / max(len(df2), 1)
+                        if nonnull_frac < 0.95:
+                            nonnull_targets = y_cat[nonnull_mask]
+                            vc = nonnull_targets.value_counts(normalize=True)
+                            if len(vc) > 0:
+                                top_frac = float(vc.iloc[0])
+                                top_cls = str(vc.index[0])
+                                if top_frac >= NONNULL_PURITY_FLAG:
+                                    flagged_detail = (
+                                        f"{n_nonnull} rows have a value, "
+                                        f"{top_frac*100:.1f}% of them → "
+                                        f"{top_cls}"
+                                    )
+
+                        # (b) + (c) Theil's U and per-value purity computed
+                        # on the FULL series (not just the non-null subset),
+                        # with NaN as its own category.  This is the key
+                        # detector for "feature effectively equivalent to
+                        # target" — covers perfect relabels (PRIMDIAG),
+                        # near-perfect with a few mislabels, and hybrid cases
+                        # where knowing the feature value including "null"
+                        # tells you the cohort.  Restricted to features with
+                        # manageable cardinality so the crosstab stays small.
+                        uc = c.get("unique_count") or 0
+                        if flagged_detail is None and uc <= 500:
+                            x_full = x_raw
+                            # Bin numerics (on the non-null portion) and
+                            # merge the null rows back as their own level.
+                            if pd.api.types.is_numeric_dtype(x_full) and uc > 20:
+                                try:
+                                    binned = pd.qcut(
+                                        x_full[nonnull_mask], q=20, duplicates="drop"
+                                    ).astype(str)
+                                    xi = pd.Series(NA_TOKEN, index=x_full.index, dtype=object)
+                                    xi.loc[nonnull_mask] = binned
+                                except Exception:
+                                    xi = x_full.astype(object).where(nonnull_mask, NA_TOKEN).astype(str)
+                            else:
+                                xi = x_full.astype(object).where(nonnull_mask, NA_TOKEN).astype(str)
+                            yi = y_cat
+
+                            try:
+                                u = _uncertainty_coefficient(xi, yi)
+                            except Exception:
+                                u = 0.0
+
+                            if u >= U_FLAG:
+                                flagged_detail = (
+                                    f"Theil's U = {u:.3f} — feature nearly "
+                                    f"determines target"
+                                )
+                            else:
+                                purity = _top_value_purity(xi, yi, min_group=MIN_VALUE_GROUP)
+                                if purity is not None:
+                                    xv, yv, p, n_g = purity
+                                    # Suppress "value = __NA__" purity hits;
+                                    # they duplicate check (a) without adding
+                                    # information.
+                                    if p >= VALUE_PURITY_FLAG and str(xv) != NA_TOKEN:
+                                        xv_s = str(xv)
+                                        if len(xv_s) > 24:
+                                            xv_s = xv_s[:21] + "..."
+                                        yv_s = str(yv)
+                                        if len(yv_s) > 24:
+                                            yv_s = yv_s[:21] + "..."
+                                        flagged_detail = (
+                                            f"U={u:.2f}; value '{xv_s}' → "
+                                            f"{p*100:.1f}% {yv_s} (n={n_g})"
+                                        )
+
+                        if flagged_detail is not None:
+                            flagged_names.add(name)
+                            suspicious.append({
+                                "name": name,
+                                "reason": "near_target_match",
+                                "detail": flagged_detail,
+                            })
+
+                    # Upgrade: drop provisional NZV / high-corr labels for
+                    # features we just flagged with a stronger reason.
+                    upgraded = flagged_names & upgradeable
+                    if upgraded:
+                        suspicious = [
+                            s for s in suspicious
+                            if not (
+                                s["name"] in upgraded
+                                and s["reason"] in ("near_zero_variance", "high_target_correlation")
+                            )
+                        ]
+                    scan_stats["flagged"] = len(flagged_names)
+                    scan_stats["upgraded"] = len(upgraded)
+
+                del df2
+                gc.collect()
+    except Exception as e:
+        logger.warning("near_target_match leakage scan skipped: %s", e)
+        scan_stats["error"] = str(e)
+
     elapsed = time.time() - start
 
-    return {
+    # Route through _jsonify to guarantee no bare NaN/Infinity literals make
+    # it into the response body.  FastAPI's default encoder uses Python's
+    # json with allow_nan=True, which emits `NaN` tokens that axios / JSON.parse
+    # reject — silently turning a 200 OK into a "scan failed" toast.
+    return _jsonify({
         "suspicious_features": suspicious,
         "total_scanned": total_scanned,
         "scan_time_seconds": round(elapsed, 2),
-    }
+        "near_target_match_stats": scan_stats,
+    })
 
 
 @router.post("/create_ensemble")
@@ -1761,38 +2106,60 @@ async def cancel_task(task_id: str):
 
 @router.get("/model/{model_id}/feature_importance")
 async def get_feature_importance(model_id: str, top_n: int = 20):
-    """Get feature importance from a trained model."""
+    """Get feature importance from a trained model.
+
+    Handles three return shapes:
+      * ndarray / list  — sklearn-native estimators return importances aligned
+        with the training feature order.
+      * dict[str, float] — endgame's GBDT/XGB/LGBM/CatBoost wrappers return
+        a dict keyed by feature name; use the dict ordering directly so the
+        result is meaningful regardless of column order.
+      * None — fall back to ``abs(coef_)`` for linear models; if that's also
+        missing, respond with an explanatory error instead of a blank chart.
+    """
     if model_id not in _models:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
     model_info = _models[model_id]
     model = model_info["model"]
+    classifier = model_info["classifier"]
 
     try:
-        # Try to get feature importance
-        if hasattr(model, 'feature_importances_'):
-            importances = model.feature_importances_
-        elif hasattr(model, 'coef_'):
-            importances = np.abs(model.coef_).flatten()
-        else:
-            return {"error": "Model does not support feature importance"}
-
-        # Get feature names from the classifier
-        classifier = model_info["classifier"]
         feature_names = classifier.get_config('X_train').columns.tolist()
+        fi = getattr(model, 'feature_importances_', None)
+        if fi is None and hasattr(model, 'coef_'):
+            fi = np.abs(model.coef_).flatten()
+        if fi is None:
+            return {"error": "Model does not expose feature_importances_ or coef_"}
 
-        # Sort by importance
-        importance_df = pd.DataFrame({
-            'feature': feature_names,
-            'importance': importances
-        }).sort_values('importance', ascending=False).head(top_n)
+        if isinstance(fi, dict):
+            names = list(fi.keys())
+            values = [float(v) for v in fi.values()]
+        else:
+            values = [float(v) for v in np.asarray(fi).ravel()]
+            if len(values) != len(feature_names):
+                # Wrapped estimators (e.g. OneVsRestClassifier) concatenate
+                # per-class coefficients, so there's no 1:1 feature alignment.
+                return {
+                    "error": (
+                        f"Importance vector length {len(values)} does not match "
+                        f"feature count {len(feature_names)} — model is likely a "
+                        f"multi-head wrapper; unwrap or average across heads."
+                    )
+                }
+            names = feature_names
+
+        importance_df = pd.DataFrame(
+            {"feature": names, "importance": values}
+        ).sort_values("importance", ascending=False).head(top_n)
 
         return {
-            "features": importance_df['feature'].tolist(),
-            "importances": importance_df['importance'].tolist()
+            "features": importance_df["feature"].tolist(),
+            "importances": importance_df["importance"].tolist(),
         }
 
     except Exception as e:
+        logger.exception("feature_importance failed for model %s", model_id)
         return {"error": str(e)}
 
 
@@ -1885,3 +2252,205 @@ async def get_classification_report(model_id: str):
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Model structure + tree visualization (endgame GlassboxMixin / TreeVisualizer)
+# ---------------------------------------------------------------------------
+
+_TREE_VIZ_CLASSES = {
+    "C50Classifier", "C50Ensemble",
+    "ObliqueDecisionTreeClassifier", "ObliqueDecisionTreeRegressor",
+    "ObliqueRandomForestClassifier", "ObliqueRandomForestRegressor",
+    "RotationForestClassifier", "RotationForestRegressor",
+    "QuantileRegressorForest", "CubistRegressor",
+    "EvolutionaryTreeClassifier", "EvolutionaryTreeRegressor",
+    "AlternatingDecisionTreeClassifier", "AlternatingModelTreeRegressor",
+    "GOSDTClassifier",
+}
+
+
+def _can_visualize_tree(model: Any) -> bool:
+    """Whether endgame's TreeVisualizer can render this model.
+
+    Detection mirrors TreeVisualizer._detect_model_type so we don't need to
+    actually extract the tree (which can be slow for large forests) just to
+    decide whether to offer the button.
+    """
+    cls = type(model).__name__
+    if cls in _TREE_VIZ_CLASSES:
+        return True
+    if hasattr(model, "tree_"):
+        return True
+    estimators = getattr(model, "estimators_", None)
+    if estimators is not None:
+        try:
+            if hasattr(estimators, "shape") and len(estimators.shape) == 2:
+                # sklearn GradientBoosting stores a 2-D array (n_est, n_classes)
+                return hasattr(estimators[0, 0], "tree_")
+            if hasattr(estimators, "__len__") and len(estimators) > 0:
+                return hasattr(estimators[0], "tree_")
+        except Exception:
+            return False
+    return False
+
+
+def _count_trees(model: Any) -> int:
+    """Number of trees in an ensemble (1 for a single tree, 0 for non-trees)."""
+    estimators = getattr(model, "estimators_", None)
+    if estimators is None:
+        return 1 if _can_visualize_tree(model) else 0
+    try:
+        if hasattr(estimators, "shape") and len(estimators.shape) == 2:
+            return int(estimators.shape[0])
+        return int(len(estimators))
+    except Exception:
+        return 1
+
+
+def _feature_names_for_model(classifier: Any) -> Optional[List[str]]:
+    """Best-effort feature-name recovery from the PIE Classifier."""
+    try:
+        X_train = classifier.get_config("X_train")
+        if X_train is not None and hasattr(X_train, "columns"):
+            return [str(c) for c in X_train.columns]
+    except Exception:
+        pass
+    return None
+
+
+def _class_names_for_model(classifier: Any) -> Optional[List[str]]:
+    """Best-effort class-name recovery (used to label leaves in tree viz)."""
+    enc = getattr(classifier, "_label_encoder", None)
+    if enc is not None and hasattr(enc, "classes_"):
+        try:
+            return [str(c) for c in enc.classes_]
+        except Exception:
+            return None
+    return None
+
+
+@router.get("/model/{model_id}/structure")
+async def get_model_structure(model_id: str):
+    """Return the winning model's glassbox structure as JSON.
+
+    Thin wrapper around endgame's ``GlassboxMixin.get_structure``.  Payload
+    shape varies by ``structure_type`` (tree, tree_ensemble, linear, additive,
+    rules, fuzzy_rules, bayesian_network, boxes, symbolic, scorecard, generic).
+    When the model doesn't implement GlassboxMixin (e.g. stock XGBoost), we
+    still report basic metadata plus whether the tree visualizer can render it.
+    """
+    if model_id not in _models:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    model_info = _models[model_id]
+    model = model_info["model"]
+    classifier = model_info["classifier"]
+
+    feature_names = _feature_names_for_model(classifier)
+    tree_viz_supported = _can_visualize_tree(model)
+    n_trees = _count_trees(model) if tree_viz_supported else 0
+
+    get_struct = getattr(model, "get_structure", None)
+    if callable(get_struct):
+        try:
+            if feature_names is not None:
+                structure = get_struct(feature_names=feature_names)
+            else:
+                structure = get_struct()
+            return {
+                "supported": True,
+                "structure": _jsonify(structure),
+                "model_type": type(model).__name__,
+                "n_features": int(structure.get("n_features", len(feature_names or []))),
+                "tree_viz_supported": tree_viz_supported,
+                "n_trees": n_trees,
+            }
+        except Exception as e:
+            logger.exception("get_structure() failed for model %s", model_id)
+            return {
+                "supported": False,
+                "structure": None,
+                "model_type": type(model).__name__,
+                "n_features": len(feature_names or []),
+                "tree_viz_supported": tree_viz_supported,
+                "n_trees": n_trees,
+                "reason": f"get_structure() raised: {e}",
+            }
+
+    return {
+        "supported": False,
+        "structure": None,
+        "model_type": type(model).__name__,
+        "n_features": len(feature_names or []),
+        "tree_viz_supported": tree_viz_supported,
+        "n_trees": n_trees,
+        "reason": "Model does not implement endgame's GlassboxMixin",
+    }
+
+
+def _jsonify(obj: Any) -> Any:
+    """Recursively coerce numpy/pandas types so get_structure() dicts survive
+    FastAPI's JSON encoder.  Kept local because the structure payloads contain
+    arbitrary nested content."""
+    if isinstance(obj, dict):
+        return {str(k): _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonify(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _jsonify(obj.tolist())
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        v = float(obj)
+        return v if np.isfinite(v) else None
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, float) and not np.isfinite(obj):
+        return None
+    return obj
+
+
+@router.get("/model/{model_id}/tree_viz", response_class=HTMLResponse)
+async def get_tree_visualization(model_id: str, tree_index: int = 0):
+    """Render endgame's interactive tree visualizer as a self-contained HTML page.
+
+    For forests, ``tree_index`` selects which base tree to render.  Raises 400
+    if the winning model isn't a supported tree type.
+    """
+    if model_id not in _models:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    model_info = _models[model_id]
+    model = model_info["model"]
+    classifier = model_info["classifier"]
+
+    if not _can_visualize_tree(model):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {type(model).__name__} is not a supported tree type for visualization",
+        )
+
+    try:
+        from endgame.visualization.tree_visualizer import TreeVisualizer
+    except ImportError:
+        raise HTTPException(status_code=500, detail="endgame.visualization not available")
+
+    feature_names = _feature_names_for_model(classifier)
+    class_names = _class_names_for_model(classifier)
+
+    try:
+        viz = TreeVisualizer(
+            model,
+            feature_names=feature_names,
+            class_names=class_names,
+            tree_index=max(0, int(tree_index)),
+            title=f"{type(model).__name__} — Decision Tree",
+        )
+        # _repr_html_ emits the same self-contained HTML as .save(), but
+        # avoids touching the filesystem.
+        html = viz._repr_html_()
+        return HTMLResponse(content=html)
+    except Exception as e:
+        logger.exception("tree_viz failed for model %s", model_id)
+        raise HTTPException(status_code=500, detail=f"Tree visualization failed: {e}")

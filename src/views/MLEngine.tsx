@@ -88,7 +88,12 @@ interface LogEntry {
 
 interface SuspiciousFeature {
   name: string;
-  reason: 'known_leakage' | 'high_target_correlation' | 'identifier' | 'near_zero_variance';
+  reason:
+    | 'near_target_match'
+    | 'known_leakage'
+    | 'high_target_correlation'
+    | 'identifier'
+    | 'near_zero_variance';
   detail: string;
 }
 
@@ -237,6 +242,10 @@ export default function MLEngine() {
   // failed / cancelled). Stale interval polls and in-flight requests for an
   // already-handled task short-circuit instead of re-running side effects.
   const handledTaskRef = useRef<string | null>(null);
+  // Consecutive failed polls. If the backend process dies mid-run, every poll
+  // throws (ECONNREFUSED) — after ~10s of failures we assume the backend is
+  // gone and surface it to the user instead of spinning forever.
+  const pollFailuresRef = useRef(0);
   // Indirection so the polling interval always invokes the freshest
   // pollTaskStatus closure (current taskId / currentStep) without resetting
   // its 2 s cadence on every render. Populated by an effect after
@@ -270,6 +279,7 @@ export default function MLEngine() {
   useEffect(() => {
     let interval: NodeJS.Timeout;
     if (taskId && taskStatus?.status === 'running') {
+      pollFailuresRef.current = 0;
       interval = setInterval(() => {
         pollTaskStatusRef.current?.();
       }, 2000);
@@ -706,6 +716,7 @@ export default function MLEngine() {
     try {
       const response = await analysisApi.getTaskStatus(polledTaskId);
       const status = response.data;
+      pollFailuresRef.current = 0;
 
       // If taskId rotated while this request was in flight, OR we've already
       // acted on this task's terminal state, drop the result on the floor.
@@ -794,6 +805,28 @@ export default function MLEngine() {
       }
     } catch (error) {
       console.error('Failed to poll task status:', error);
+      pollFailuresRef.current += 1;
+      // 5 failures × 2s interval = ~10s of silence. At that point the backend
+      // is almost certainly dead (crashed native extension, OOM, or RLIMIT_AS
+      // trip) rather than briefly slow. Stop polling and tell the user, so
+      // they aren't stranded watching a frozen progress bar.
+      if (pollFailuresRef.current >= 5 && handledTaskRef.current !== polledTaskId) {
+        handledTaskRef.current = polledTaskId;
+        transitioningRef.current = false;
+        addLog(
+          'Lost connection to backend (5 failed polls). The Python process likely crashed — check the terminal for a traceback.',
+          'error',
+        );
+        addToast(
+          'Backend stopped responding. Training aborted — check the terminal for a crash traceback.',
+          'error',
+        );
+        setLoading(false);
+        setCurrentStep('configure');
+        removeTask(polledTaskId);
+        setTaskId(null);
+        setTaskStatus(null);
+      }
     }
   }, [taskId, currentStep, setAnalysis, addLog, addToast, updateTask, removeTask, navigate, runFeatureSelection, runModelTraining]);
 
@@ -1366,16 +1399,18 @@ export default function MLEngine() {
                           Exclude All Detected
                         </Button>
                       </div>
-                      {(['known_leakage', 'high_target_correlation', 'identifier', 'near_zero_variance'] as const).map((reason) => {
+                      {(['near_target_match', 'known_leakage', 'high_target_correlation', 'identifier', 'near_zero_variance'] as const).map((reason) => {
                         const group = leakageScanResults.filter((f) => f.reason === reason);
                         if (group.length === 0) return null;
                         const labels: Record<string, string> = {
+                          near_target_match: 'Near-Perfect Target Predictor',
                           known_leakage: 'Known Leakage',
                           high_target_correlation: 'High Target Correlation',
                           identifier: 'Identifier Columns',
                           near_zero_variance: 'Near-Zero Variance',
                         };
                         const colors: Record<string, string> = {
+                          near_target_match: 'text-red-500',
                           known_leakage: 'text-red-400',
                           high_target_correlation: 'text-orange-400',
                           identifier: 'text-blue-400',

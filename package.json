@@ -10,8 +10,8 @@
     "build": "tsc && vite build",
     "build:electron": "npm run build && electron-builder",
     "preview": "vite preview",
-    "backend": "cd backend && python3 -m uvicorn main:app --reload --port 8100",
-    "start": "concurrently \"npm run backend\" \"npm run dev\""
+    "backend": "cd backend && ./venv/bin/python -m uvicorn main:app --reload --port 8100",
+    "start": "npm run dev"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.0.5",

@@ -81,10 +81,15 @@ PIE Workbench uses a hybrid desktop architecture:
 
 ### Setup
 
-1. **Clone the repository:**
+1. **Clone the repository (including submodules):**
    ```bash
-   git clone https://github.com/MJFF-ResearchCommunity/PIE-Workbench.git
+   git clone --recurse-submodules https://github.com/MJFF-ResearchCommunity/PIE-Workbench.git
    cd PIE-Workbench
+   ```
+
+   Already cloned without `--recurse-submodules`? Pull the submodules now:
+   ```bash
+   git submodule update --init --recursive
    ```
 
 2. **Install frontend dependencies:**
@@ -100,9 +105,17 @@ PIE Workbench uses a hybrid desktop architecture:
    pip install -r requirements.txt
    ```
 
-4. **Install PIE and PIE-clean libraries:**
+4. **Install PIE, PIE-clean, and their dependencies:**
    ```bash
    # Still in backend/ with venv activated
+
+   # PIE's own dependencies (endgame-ml, shap, statsmodels, ...).
+   # Required — PIE's setup.py does not declare install_requires, so
+   # `pip install -e ../lib/PIE` alone is NOT enough.
+   pip install -r ../lib/PIE/requirements.txt
+
+   # The library packages themselves, editable so updates to the
+   # submodules reflect without a reinstall.
    pip install -e ../lib/PIE
    pip install -e ../lib/PIE-clean
    cd ..

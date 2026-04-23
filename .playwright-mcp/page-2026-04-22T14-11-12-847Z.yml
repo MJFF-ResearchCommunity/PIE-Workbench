@@ -1,0 +1,88 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - img "PIE Workbench" [ref=e7]
+      - heading "PIE Workbench" [level=1] [ref=e9]
+    - navigation [ref=e10]:
+      - button "Project Hub" [ref=e11] [cursor=pointer]:
+        - img [ref=e12]
+        - generic [ref=e15]: Project Hub
+      - button "Data Ingestion" [ref=e16] [cursor=pointer]:
+        - img [ref=e17]
+        - generic [ref=e21]: Data Ingestion
+      - button "ML Engine" [ref=e22] [cursor=pointer]:
+        - img [ref=e23]
+        - generic [ref=e26]: ML Engine
+      - button "Statistics" [ref=e27] [cursor=pointer]:
+        - img [ref=e28]
+        - generic [ref=e30]: Statistics
+      - button "Results" [ref=e31] [cursor=pointer]:
+        - img [ref=e32]
+        - generic [ref=e35]: Results
+    - button [ref=e36] [cursor=pointer]:
+      - img [ref=e37]
+  - main [ref=e39]:
+    - generic [ref=e43]:
+      - generic [ref=e44]:
+        - img "PIE Workbench" [ref=e46]
+        - heading "PIE Workbench" [level=1] [ref=e47]
+      - generic [ref=e48]:
+        - generic [ref=e52] [cursor=pointer]:
+          - img [ref=e54]
+          - heading "New Analysis" [level=3] [ref=e55]
+          - paragraph [ref=e56]: Start a fresh project with your data
+        - generic [ref=e60] [cursor=pointer]:
+          - img [ref=e62]
+          - heading "Open Project" [level=3] [ref=e64]
+          - paragraph [ref=e65]: Continue with an existing project
+      - generic [ref=e66]:
+        - generic [ref=e67]:
+          - img [ref=e68]
+          - generic [ref=e71]: Recent Projects
+        - generic [ref=e72]:
+          - button "test18 /home/cameron/PIE/pie_output_test18/project.pie 4/22/2026" [ref=e73] [cursor=pointer]:
+            - img [ref=e74]
+            - generic [ref=e76]:
+              - paragraph [ref=e77]: test18
+              - paragraph [ref=e78]: /home/cameron/PIE/pie_output_test18/project.pie
+            - generic [ref=e79]: 4/22/2026
+          - button "test16 /home/cameron/PIE/pie_output_test16/project.pie 4/4/2026" [ref=e80] [cursor=pointer]:
+            - img [ref=e81]
+            - generic [ref=e83]:
+              - paragraph [ref=e84]: test16
+              - paragraph [ref=e85]: /home/cameron/PIE/pie_output_test16/project.pie
+            - generic [ref=e86]: 4/4/2026
+          - button "test15 /home/cameron/PIE/pie_output_test15/project.pie 4/4/2026" [ref=e87] [cursor=pointer]:
+            - img [ref=e88]
+            - generic [ref=e90]:
+              - paragraph [ref=e91]: test15
+              - paragraph [ref=e92]: /home/cameron/PIE/pie_output_test15/project.pie
+            - generic [ref=e93]: 4/4/2026
+          - button "test14 /home/cameron/PIE/pie_output_test14/project.pie 3/20/2026" [ref=e94] [cursor=pointer]:
+            - img [ref=e95]
+            - generic [ref=e97]:
+              - paragraph [ref=e98]: test14
+              - paragraph [ref=e99]: /home/cameron/PIE/pie_output_test14/project.pie
+            - generic [ref=e100]: 3/20/2026
+          - button "test13 /home/cameron/PIE/pie_output_test13/project.pie 3/20/2026" [ref=e101] [cursor=pointer]:
+            - img [ref=e102]
+            - generic [ref=e104]:
+              - paragraph [ref=e105]: test13
+              - paragraph [ref=e106]: /home/cameron/PIE/pie_output_test13/project.pie
+            - generic [ref=e107]: 3/20/2026
+      - generic [ref=e108]:
+        - generic [ref=e109]:
+          - img [ref=e110]
+          - heading "Data Ingestion" [level=4] [ref=e114]
+          - paragraph [ref=e115]: Load and visualize PPMI data with automatic modality detection
+        - generic [ref=e116]:
+          - img [ref=e117]
+          - heading "ML Engine" [level=4] [ref=e120]
+          - paragraph [ref=e121]: Train and compare machine learning models with visual pipelines
+        - generic [ref=e122]:
+          - img [ref=e123]
+          - heading "Statistics Lab" [level=4] [ref=e125]
+          - paragraph [ref=e126]: Perform statistical tests and survival analysis
+      - paragraph [ref=e127]:
+        - img [ref=e128]
+        - text: Version 1.0.0 — Powered by PIE & PIE-clean
