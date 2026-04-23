@@ -1,5 +1,8 @@
 # PIE Workbench
 
+[![Backend tests](https://github.com/MJFF-ResearchCommunity/PIE-Workbench/actions/workflows/backend-tests.yml/badge.svg)](https://github.com/MJFF-ResearchCommunity/PIE-Workbench/actions/workflows/backend-tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A modern GUI for the Parkinson's Insight Engine (PIE) ecosystems.
 
 ![PIE Workbench](icon.png)
