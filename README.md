@@ -97,25 +97,17 @@ PIE Workbench uses a hybrid desktop architecture:
    npm install
    ```
 
-3. **Set up Python virtual environment:**
+3. **Set up the Python backend:**
    ```bash
    cd backend
    python -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+   # All backend + PIE + PIE-clean runtime deps are bundled here.
    pip install -r requirements.txt
-   ```
 
-4. **Install PIE, PIE-clean, and their dependencies:**
-   ```bash
-   # Still in backend/ with venv activated
-
-   # PIE's own dependencies (endgame-ml, shap, statsmodels, ...).
-   # Required — PIE's setup.py does not declare install_requires, so
-   # `pip install -e ../lib/PIE` alone is NOT enough.
-   pip install -r ../lib/PIE/requirements.txt
-
-   # The library packages themselves, editable so updates to the
-   # submodules reflect without a reinstall.
+   # Install the two submodule libraries in editable mode so updates
+   # to lib/PIE and lib/PIE-clean reflect without a reinstall.
    pip install -e ../lib/PIE
    pip install -e ../lib/PIE-clean
    cd ..

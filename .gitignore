@@ -38,6 +38,14 @@ npm-debug.log*
 # Cache
 .cache/
 *.prof
+.pytest_cache/
 
 # Output directories
 output/
+
+# Playwright MCP artifacts
+.playwright-mcp/
+
+# Dev screenshots (keep icon.png via .gitattributes / explicit add)
+/*.png
+!/icon.png

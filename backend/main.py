@@ -74,11 +74,18 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Configure CORS for Electron frontend
+# Configure CORS for the local frontend (Vite dev server + packaged Electron).
+# The backend has no authentication and is bound to 127.0.0.1, so we scope
+# origins tightly rather than using "*". Electron's packaged renderer loads
+# via file:// which sends Origin: null.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "null",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -104,4 +111,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8100)
