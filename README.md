@@ -5,11 +5,15 @@
 
 A modern GUI for the Parkinson's Insight Engine (PIE) ecosystems.
 
-![PIE Workbench](icon.png)
+<p align="center">
+  <img src="icon.png" alt="PIE Workbench" width="180" />
+</p>
 
 ## Overview
 
-PIE Workbench is a user-friendly, modular desktop application designed for clinical researchers and data scientists focusing on Parkinson's Disease. It provides advanced analytics (Machine Learning & Statistics) without requiring users to write code.
+PIE Workbench is a user-friendly, modular desktop application designed for clinical researchers and data scientists focusing on Parkinson's Disease. It brings **classical statistical analysis** and **state-of-the-art machine learning** together in a single platform — **no code required**.
+
+Powered under the hood by [endgame](https://github.com/allianceai/endgame), PIE Workbench lets domain experts go from raw clinical data to publication-ready statistics and ML results without writing a line of Python.
 
 **Inspiration:** WEKA (functionality) meets Modern Web Apps (aesthetics/usability).
 
@@ -118,7 +122,14 @@ PIE Workbench uses a hybrid desktop architecture:
 
 ### Running the Application
 
-**Option 1: Development mode (recommended for development)**
+**Option 1: Full Electron app (recommended for most users)**
+
+Make sure the backend is running first, then:
+```bash
+npm start
+```
+
+**Option 2: Development mode (recommended for development)**
 
 Open two terminals:
 
@@ -137,7 +148,7 @@ Then open http://localhost:5173 in your browser, or run the Electron app:
 npm run dev:electron
 ```
 
-**Option 2: Using npm scripts**
+**Option 3: Using npm scripts**
 
 ```bash
 # Backend only (requires venv to be activated first)
@@ -148,13 +159,6 @@ npm run dev:react
 
 # Electron + Frontend (backend must be running separately)
 npm run dev
-```
-
-**Option 3: Full Electron app**
-
-Make sure the backend is running first, then:
-```bash
-npm start
 ```
 
 ### Verifying the Setup
@@ -274,9 +278,11 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Acknowledgments
 
+- Cameron Hamilton
 - PPMI (Parkinson's Progression Markers Initiative)
 - The Michael J. Fox Foundation
 - PIE and PIE-clean library contributors
+- [Alliance AI](https://github.com/allianceai) — creators of [endgame](https://github.com/allianceai/endgame), the engine powering PIE Workbench's ML and statistics
 
 ## Support
 
